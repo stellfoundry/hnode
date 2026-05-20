@@ -1,0 +1,1116 @@
+import torch
+import numpy as np
+import skfem
+import time
+import os
+import warnings
+
+# sparse_solve is an optional cuDSS-backed extension for GPU-sparse linear solves.
+# It is not required for the examples in this repository (all use use_sparse_solver=False).
+# If you have cuDSS available and wish to enable it, build the extension separately
+# and set use_sparse_solver=True in HybridNODESolver.
+try:
+    from sparse_solve import sparse_linear_solve
+except ImportError:
+    sparse_linear_solve = None
+
+
+class HybridNODESolver:
+    def __init__(
+        self,
+        nn_rhs_model,
+        delta_t,
+        N_t,
+        num_fields,
+        num_training_rollouts,
+        max_iters=100,
+        tol=1e-12,
+        verbose=False,
+        backprop_type="matrix_free",
+        use_manual_jacobian=True,
+        use_sparse_solver=True,
+        use_cpu_solver=False,
+        device=None,
+    ):
+        """
+        Initialize the HybridNODESolver.
+
+        Args:
+            nn_rhs_model: Neural network model for the right-hand side.
+            delta_t: Time step size.
+            N_t: Number of time steps (+1).
+            num_fields: Number of fields in the system.
+            num_training_rollouts: Number of training rollouts.
+            max_iters: Maximum number of iterations for convergence.
+            tol: Tolerance for convergence.
+            verbose: Whether to print verbose output.
+            backprop_type: Type of backpropagation method to use ("matrix_free" or "schur").
+            use_manual_jacobian: Whether to use manual Jacobian construction.
+            use_sparse_solver: Whether to use a sparse solver for linear systems.
+            use_cpu_solver: Whether to use CPU solver for sparse linear systems.
+            device: Device to run computations on (default is CUDA if available).
+
+        """
+        self.nn_rhs_model = nn_rhs_model
+        self.delta_t = delta_t
+        self.N_t = N_t
+        self.num_fields = num_fields
+        self.num_training_rollouts = num_training_rollouts
+        self.max_iters = max_iters
+        self.tol = tol
+        self.verbose = verbose
+        self.backprop_type = backprop_type
+        self.use_manual_jacobian = use_manual_jacobian
+        self.use_sparse_solver = use_sparse_solver
+        self.use_cpu_solver = use_cpu_solver
+
+        if self.use_manual_jacobian:
+            assert (
+                self.backprop_type == "matrix_free"
+            ), "Manual Jacobian construction is only supported with matrix-free backpropagation"
+        if self.use_sparse_solver:
+            assert (
+                self.use_manual_jacobian
+            ), "Manual Jacobian construction is required for sparse solver"
+            assert (
+                self.backprop_type == "matrix_free"
+            ), "Sparse solver is only supported with matrix-free backpropagation"
+
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+
+        self.A, self.M_p0, self.exp_M_p0 = self._build_A_and_M_p0()
+
+        # Cache A_inv for quick initialization of params during solve
+        self.A_inv = torch.linalg.inv(self.A)
+
+        if self.backprop_type == "schur":
+            # Compute permutation indices
+            (
+                self.permutation_indices_without_lambdas,
+                self.permutation_indices,
+            ) = self._compute_permutation_indices()
+            # Compute matrices need for Schur complement
+            self.B = self._compute_B()
+            self.C = self._compute_C()
+            self.D = self._compute_D()
+
+    def _evaluate_sparse_function(self, basis, weights_exponent=0.5, operation=None):
+        """
+        Evaluate a sparse function using the given basis.
+
+        Args:
+            basis: The basis for evaluation.
+            weights_exponent: Exponent for weights computation.
+            operation: Operation to perform ("grad" for gradient, None for value).
+
+        Returns:
+            A sparse tensor representation of the evaluated function.
+        """
+        weights = basis.dx.reshape(-1) ** weights_exponent
+
+        rows = []
+        cols = []
+        vals = []
+
+        for i in range(basis.N):
+            x = np.zeros(basis.N)
+            x[i] = 1.0
+            # Evaluate the basis function at quadrature points and multiply by weights
+            if operation == "grad":
+                eval_result = basis.interpolate(x).grad.reshape(-1) * weights
+            else:
+                eval_result = basis.interpolate(x).value.reshape(-1) * weights
+
+            nonzero_indices = np.nonzero(eval_result)[0]
+            if len(nonzero_indices) > 0:
+                rows.extend([i] * len(nonzero_indices))
+                cols.extend(nonzero_indices)
+                vals.extend(eval_result[nonzero_indices])
+
+        sparse_tensor = torch.sparse_coo_tensor(
+            torch.tensor([rows, cols]),
+            torch.tensor(vals),
+            size=(basis.N, len(weights)),
+        ).coalesce()
+
+        return sparse_tensor
+
+    def _sparse_zeros_like(self, sparse_tensor):
+        """
+        Create a sparse tensor of zeros with the same size and sparsity pattern as the input.
+
+        Args:
+            sparse_tensor: The sparse tensor to mimic.
+
+        Returns:
+            A sparse tensor of zeros.
+        """
+        return torch.sparse_coo_tensor(
+            sparse_tensor.indices(),
+            torch.zeros(sparse_tensor._nnz(), device=sparse_tensor.device),
+            sparse_tensor.size(),
+        )
+
+    def _sparse_zeros(self, size):
+        """
+        Create a sparse tensor of zeros with the given size.
+
+        Args:
+            size: The size of the sparse tensor.
+
+        Returns:
+            A sparse tensor of zeros.
+        """
+        return torch.sparse_coo_tensor(
+            torch.empty((2, 0), dtype=torch.long), torch.empty(0), size
+        )
+
+    def _sparse_kron(self, A, B):
+        """
+        Compute Kronecker product of two sparse COO matrices without densification.
+
+        For matrices A (m x n) and B (p x q), computes C = A ⊗ B of size (mp x nq).
+        Each element A[i,j] is multiplied by the entire matrix B and placed at
+        the appropriate block position in the result.
+
+        Args:
+            A: torch.sparse_coo_tensor of shape (m, n)
+            B: torch.sparse_coo_tensor of shape (p, q)
+
+        Returns:
+            C: torch.sparse_coo_tensor of shape (m*p, n*q) representing A ⊗ B
+        """
+        # Input validation
+        if not (A.is_sparse and B.is_sparse):
+            raise ValueError("Both inputs must be sparse tensors")
+
+        if A.layout != torch.sparse_coo or B.layout != torch.sparse_coo:
+            raise ValueError("Both inputs must be in COO format")
+
+        # Ensure inputs are coalesced (combines duplicate indices)
+        A = A.coalesce()
+        B = B.coalesce()
+
+        # Get dimensions
+        m, n = A.shape
+        p, q = B.shape
+
+        # Handle empty matrices
+        if A._nnz() == 0 or B._nnz() == 0:
+            return torch.sparse_coo_tensor(
+                torch.empty((2, 0), dtype=torch.long, device=A.device),
+                torch.empty(
+                    (0,), dtype=torch.result_type(A.dtype, B.dtype), device=A.device
+                ),
+                (m * p, n * q),
+            )
+
+        # Get indices and values
+        A_indices = A.indices()  # 2 × nnz_A
+        A_values = A.values()  # nnz_A
+        B_indices = B.indices()  # 2 × nnz_B
+        B_values = B.values()  # nnz_B
+
+        nnz_A = A_values.shape[0]
+        nnz_B = B_values.shape[0]
+
+        # For each non-zero element A[i,j] and each non-zero element B[k,l],
+        # we create an element at position (i*p + k, j*q + l) with value A[i,j] * B[k,l]
+
+        # Create all combinations using broadcasting
+        # Shape: nnz_A × nnz_B for each component
+        A_row_expanded = A_indices[0].unsqueeze(1).expand(-1, nnz_B)  # nnz_A × nnz_B
+        A_col_expanded = A_indices[1].unsqueeze(1).expand(-1, nnz_B)  # nnz_A × nnz_B
+        A_val_expanded = A_values.unsqueeze(1).expand(-1, nnz_B)  # nnz_A × nnz_B
+
+        B_row_expanded = B_indices[0].unsqueeze(0).expand(nnz_A, -1)  # nnz_A × nnz_B
+        B_col_expanded = B_indices[1].unsqueeze(0).expand(nnz_A, -1)  # nnz_A × nnz_B
+        B_val_expanded = B_values.unsqueeze(0).expand(nnz_A, -1)  # nnz_A × nnz_B
+
+        # Compute result indices
+        # Row: i*p + k, Col: j*q + l
+        result_rows = A_row_expanded * p + B_row_expanded  # nnz_A × nnz_B
+        result_cols = A_col_expanded * q + B_col_expanded  # nnz_A × nnz_B
+
+        # Flatten to get final indices
+        result_indices = torch.stack(
+            [result_rows.flatten(), result_cols.flatten()]
+        )  # 2 × (nnz_A * nnz_B)
+
+        # Compute result values
+        result_values = (A_val_expanded * B_val_expanded).flatten()  # nnz_A * nnz_B
+
+        # Create result sparse tensor
+        C = torch.sparse_coo_tensor(
+            result_indices,
+            result_values,
+            (m * p, n * q),
+            dtype=torch.float64,
+            device=A.device,
+        )
+
+        # Coalesce to combine any duplicate indices (shouldn't happen, but good practice)
+        return C.coalesce()
+
+    def _build_A_and_M_p0(self):
+        """
+        Build the A matrix and M_p0 matrix used for rollouts.
+
+        Returns:
+            A tuple (A, M_p0) of matrices.
+        """
+        with torch.no_grad():
+            mesh = skfem.MeshLine(np.linspace(0.0, self.delta_t, self.N_t))
+            p0_element = skfem.ElementLineP0()
+            rt_element = skfem.ElementLineP1()
+            p0_basis = skfem.Basis(mesh, p0_element)
+            rt_basis = skfem.Basis(mesh, rt_element)
+
+            p0_eval = self._evaluate_sparse_function(p0_basis)
+            rt_eval = self._evaluate_sparse_function(rt_basis)
+            rt_div_eval = self._evaluate_sparse_function(rt_basis, operation="grad")
+
+            indices_C1 = torch.tensor([[0, 0]])
+            values_C1 = torch.tensor([1.0])
+            size_C1 = (self.N_t, 1)
+            C1_sparse = torch.sparse_coo_tensor(indices_C1.t(), values_C1, size_C1)
+
+            indices_C2 = torch.tensor([[self.N_t - 1, 0]])
+            values_C2 = torch.tensor([-1.0])
+            size_C2 = (self.N_t, 1)
+            C2_sparse = torch.sparse_coo_tensor(indices_C2.t(), values_C2, size_C2)
+
+            M_p0 = p0_eval @ p0_eval.T
+            M_rt = rt_eval @ rt_eval.T
+            G = p0_eval @ rt_div_eval.T
+
+            self.M_rt = M_rt
+            self.G = G
+
+            first_row_block = torch.cat([M_rt, G.T, C1_sparse, C2_sparse], dim=1)
+            second_row_block = torch.cat(
+                [
+                    G,
+                    self._sparse_zeros_like(M_p0),
+                    self._sparse_zeros((self.N_t - 1, 2)),
+                ],
+                dim=1,
+            )
+            third_row_block = torch.cat(
+                [
+                    C1_sparse.T,
+                    self._sparse_zeros((1, self.N_t - 1)),
+                    self._sparse_zeros((1, 2)),
+                ],
+                dim=1,
+            )
+            fourth_row_block = torch.cat(
+                [
+                    C2_sparse.T,
+                    self._sparse_zeros((1, self.N_t - 1)),
+                    self._sparse_zeros((1, 2)),
+                ],
+                dim=1,
+            )
+
+            A = torch.cat(
+                [
+                    first_row_block,
+                    second_row_block,
+                    third_row_block,
+                    fourth_row_block,
+                ],
+                dim=0,
+            )
+
+            # Even for very large systems, storing *one* dense version of each of these should be fine (for ODEs)
+            A = A.to_dense().double()
+            M_p0 = M_p0.to_dense().double()
+
+            A[-1, :] = 0.0
+            A[-1, -2] = 1.0
+
+            A = torch.kron(torch.eye(self.num_fields, device=A.device), A)
+
+            N = A.shape[0] // self.num_fields
+            exp_M_p0 = torch.zeros_like(A)
+            for field_ndx in range(self.num_fields):
+                exp_M_p0[
+                    field_ndx * N
+                    + self.N_t : field_ndx * N
+                    + self.N_t
+                    + (self.N_t - 1),
+                    field_ndx * N
+                    + self.N_t : field_ndx * N
+                    + self.N_t
+                    + (self.N_t - 1),
+                ] = M_p0
+
+            self.A_sparse = A.to_sparse_coo().to(self.device)
+            self.exp_M_p0_sparse = exp_M_p0.to_sparse_coo().to(self.device)
+
+            return A.to(self.device), M_p0.to(self.device), exp_M_p0.to(self.device)
+
+    def _build_indexers(self, batch_size):
+        N = self.N_t + (self.N_t - 1) + 2
+
+        index_matrix = torch.arange(
+            batch_size * self.num_fields * N * self.num_fields * N, device=self.device
+        ).reshape(batch_size, self.num_fields * N, self.num_fields * N)
+
+        u_hat_u_hat_indices = []
+        u_hat_u_hat_rows = []
+        u_hat_u_hat_cols = []
+        for batch_ndx in range(batch_size):
+            for row_field_ndx in range(self.num_fields):
+                for col_field_ndx in range(self.num_fields):
+                    row_start = row_field_ndx * N
+                    col_start = col_field_ndx * N
+                    u_hat_u_hat_indices.append(
+                        index_matrix[
+                            batch_ndx,
+                            row_start
+                            + self.N_t : row_start
+                            + self.N_t
+                            + (self.N_t - 1),
+                            col_start
+                            + self.N_t : col_start
+                            + self.N_t
+                            + (self.N_t - 1),
+                        ].diag()
+                    )
+                    rows = batch_ndx * N * self.num_fields + torch.arange(
+                        row_start + self.N_t, row_start + self.N_t + (self.N_t - 1)
+                    )
+                    cols = batch_ndx * N * self.num_fields + torch.arange(
+                        col_start + self.N_t, col_start + self.N_t + (self.N_t - 1)
+                    )
+                    u_hat_u_hat_rows.append(rows)
+                    u_hat_u_hat_cols.append(cols)
+        self.u_hat_u_hat_indices = torch.cat(u_hat_u_hat_indices)
+        self.u_hat_u_hat_coo_indices = torch.stack(
+            [torch.cat(u_hat_u_hat_rows), torch.cat(u_hat_u_hat_cols)], dim=0
+        ).to(self.device)
+
+        u_hat_J_hat_left_indices = []
+        u_hat_J_hat_right_indices = []
+        u_hat_J_hat_rows = []
+        u_hat_J_hat_left_cols = []
+        u_hat_J_hat_right_cols = []
+        for batch_ndx in range(batch_size):
+            for row_field_ndx in range(self.num_fields):
+                for col_field_ndx in range(self.num_fields):
+                    row_start = row_field_ndx * N
+                    col_start = col_field_ndx * N
+                    u_hat_indices = torch.arange(
+                        row_start + self.N_t,
+                        row_start + self.N_t + (self.N_t - 1),
+                        device=self.device,
+                    )
+                    rows = batch_ndx * N * self.num_fields + u_hat_indices
+                    u_hat_J_hat_rows.append(rows)
+                    J_hat_left_indices = torch.arange(
+                        col_start, col_start + self.N_t - 1, device=self.device
+                    )
+                    cols = batch_ndx * N * self.num_fields + J_hat_left_indices
+                    u_hat_J_hat_left_cols.append(cols)
+                    J_hat_right_indices = torch.arange(
+                        col_start + 1, col_start + self.N_t, device=self.device
+                    )
+                    cols = batch_ndx * N * self.num_fields + J_hat_right_indices
+                    u_hat_J_hat_right_cols.append(cols)
+                    u_hat_J_hat_left_indices.append(
+                        index_matrix[batch_ndx, u_hat_indices, J_hat_left_indices]
+                    )
+                    u_hat_J_hat_right_indices.append(
+                        index_matrix[batch_ndx, u_hat_indices, J_hat_right_indices]
+                    )
+        self.u_hat_J_hat_left_indices = torch.cat(u_hat_J_hat_left_indices)
+        self.u_hat_J_hat_right_indices = torch.cat(u_hat_J_hat_right_indices)
+        self.u_hat_J_hat_left_coo_indices = torch.stack(
+            [torch.cat(u_hat_J_hat_rows), torch.cat(u_hat_J_hat_left_cols)], dim=0
+        )
+        self.u_hat_J_hat_right_coo_indices = torch.stack(
+            [torch.cat(u_hat_J_hat_rows), torch.cat(u_hat_J_hat_right_cols)], dim=0
+        )
+
+        self.combined_coo_indices = torch.cat(
+            [
+                self.u_hat_u_hat_coo_indices,
+                self.u_hat_J_hat_left_coo_indices,
+                self.u_hat_J_hat_right_coo_indices,
+            ],
+            dim=1,
+        )
+
+        self.batched_A_sparse = self._sparse_kron(
+            torch.eye(batch_size, device=self.device).to_sparse_coo(), self.A_sparse
+        )
+        self.batched_exp_M_p0_sparse = self._sparse_kron(
+            torch.eye(batch_size, device=self.device).to_sparse_coo(),
+            self.exp_M_p0_sparse,
+        )
+
+    def _init_params(self, J_init, u_init):
+        batch_size = J_init.shape[0]
+        rhs = torch.zeros(
+            batch_size,
+            self.N_t + (self.N_t - 1) + 2,
+            self.num_fields,
+            device=self.device,
+            dtype=torch.float64,
+        )
+        rhs[:, -2, :] = J_init
+        rhs[:, -1, :] = u_init
+        return (self.A_inv @ rhs.transpose(-2, -1).reshape(batch_size, -1, 1)).squeeze(
+            -1
+        )
+
+    def _compute_residual(self, params, J_init, u_init):
+        """
+        Compute the residual of the system.
+
+        Args:
+            params: Parameters of the system.
+            J_init: Initial J values.
+            u_init: Initial u values.
+
+        Returns:
+            A tuple (residual, residual) of the computed residual.
+        """
+        params_reshaped = params.reshape(self.num_fields, -1).transpose(-2, -1)
+        J_hat = params_reshaped[: self.N_t, :]
+        u_hat = params_reshaped[self.N_t : -2, :]
+
+        linear_part = self.A @ params
+        if hasattr(self.nn_rhs_model, "forward_original"):
+            forward_func = self.nn_rhs_model.forward_original
+        else:
+            # try to use the default forward method, though this might give an error
+            forward_func = self.nn_rhs_model.forward
+        nonlinear_part = self.M_p0 @ forward_func(
+            J_hat,
+            u_hat,
+        )
+        nonlinear_part = (
+            torch.cat(
+                [
+                    torch.zeros_like(J_hat),
+                    nonlinear_part,
+                    torch.zeros(2, self.num_fields, device=self.device),
+                ]
+            )
+            .transpose(-2, -1)
+            .reshape(-1)
+        )
+        residual = linear_part + nonlinear_part
+        residual = residual.squeeze(-1)
+        rhs = torch.zeros_like(params_reshaped)
+        rhs[-2, :] = J_init
+        rhs[-1, :] = u_init
+        residual = residual - rhs.transpose(-2, -1).reshape(-1)
+        return residual, residual
+
+    def _compute_J_and_residual(self, params, J_init, u_init, z=None, is_final=False):
+        """
+        Compute the Jacobian and residual of the system.
+
+        Args:
+            params: Parameters of the system.
+            J_init: Initial J values.
+            u_init: Initial u values.
+
+        Returns:
+            A tuple (Jacobian, residual).
+        """
+        batch_size = params.shape[0]
+        params_reshaped = params.reshape(batch_size, self.num_fields, -1).transpose(
+            -2, -1
+        )
+        J_hat = params_reshaped[:, : self.N_t, :]
+        u_hat = params_reshaped[:, self.N_t : -2, :]
+
+        t_start = time.time()
+        (u_hat_jacobian, z_jacobians), u_hat_forcing = self.nn_rhs_model(
+            J_hat, u_hat, z
+        )
+        t_end = time.time()
+        if not hasattr(self, "nn_time"):
+            self.nn_time = 0.0
+        self.nn_time += t_end - t_start
+
+        # self.u_hat_forcing = u_hat_forcing.clone().detach().cpu()
+
+        linear_part = (self.A @ params.unsqueeze(-1)).squeeze(-1)
+        nonlinear_part = self.M_p0 @ u_hat_forcing
+        nonlinear_part = (
+            torch.cat(
+                [
+                    torch.zeros_like(J_hat),
+                    nonlinear_part,
+                    torch.zeros(batch_size, 2, self.num_fields, device=self.device),
+                ],
+                dim=1,
+            )
+            .transpose(-2, -1)
+            .reshape(batch_size, -1)
+        )
+        residual = linear_part + nonlinear_part
+
+        rhs = torch.cat(
+            [
+                torch.zeros(
+                    batch_size,
+                    params_reshaped.shape[1] - 2,
+                    self.num_fields,
+                    device=self.device,
+                ),
+                J_init.unsqueeze(1),
+                u_init.unsqueeze(1),
+            ],
+            dim=1,
+        )
+
+        residual = residual - rhs.transpose(-2, -1).reshape(batch_size, -1)
+
+        if not hasattr(self, "batch_size") or self.batch_size != batch_size:
+            print("rebuilding indexers... ")
+            self.batch_size = batch_size
+            self._build_indexers(batch_size)
+            print("done rebuilding indexers")
+
+        N = self.N_t + (self.N_t - 1) + 2
+        if not self.use_sparse_solver:
+            target_Jacobian = torch.zeros(
+                batch_size * self.num_fields * N * self.num_fields * N,
+                device=self.device,
+                dtype=torch.float64,
+            ).contiguous()
+            target_Jacobian = torch.scatter_add(
+                target_Jacobian,
+                0,
+                self.u_hat_u_hat_indices,
+                u_hat_jacobian.permute(0, 2, 3, 1).contiguous().reshape(-1),
+            )
+            target_Jacobian = torch.scatter_add(
+                target_Jacobian,
+                0,
+                self.u_hat_J_hat_left_indices,
+                z_jacobians.permute(3, 0, 2, 4, 1)[0].contiguous().reshape(-1),
+            )
+            target_Jacobian = torch.scatter_add(
+                target_Jacobian,
+                0,
+                self.u_hat_J_hat_right_indices,
+                z_jacobians.permute(3, 0, 2, 4, 1)[1].contiguous().reshape(-1),
+            )
+            target_Jacobian = target_Jacobian.contiguous()
+            J = self.A + torch.matmul(
+                self.exp_M_p0,
+                target_Jacobian.reshape(
+                    batch_size, self.num_fields * N, self.num_fields * N
+                ),
+            )
+            neural_jac = torch.matmul(
+                self.exp_M_p0,
+                target_Jacobian.reshape(
+                    batch_size, self.num_fields * N, self.num_fields * N
+                ),
+            )
+            if is_final and hasattr(self, "neural_jacs"):
+                self.neural_jacs.append(neural_jac)
+        else:
+            J = torch.sparse_coo_tensor(
+                self.combined_coo_indices,
+                torch.cat(
+                    [
+                        u_hat_jacobian.permute(0, 2, 3, 1).reshape(-1),
+                        z_jacobians.permute(3, 0, 2, 4, 1)[0].reshape(-1),
+                        z_jacobians.permute(3, 0, 2, 4, 1)[1].reshape(-1),
+                    ]
+                ),
+                size=(
+                    batch_size * self.num_fields * N,
+                    batch_size * self.num_fields * N,
+                ),
+                device=self.device,
+            )
+            J = self.batched_A_sparse + self.batched_exp_M_p0_sparse @ J
+            J = J.coalesce()
+
+        return J, residual
+
+    def _timestep(self, J_init, u_init, z=None, use_cpu_solver=False):
+        """
+        Perform a single timestep of the system.
+
+        Args:
+            J_init: Initial J values.
+            u_init: Initial u values.
+
+        Returns:
+            A tuple (params, (lhs, rhs)) of the computed parameters and linear system.
+        """
+        # Infer batch size from input
+        batch_size = J_init.shape[0]
+
+        params = self._init_params(J_init, u_init)
+        if self.nn_rhs_model.dropout_rate > 0:
+            seed = int(time.time())
+        eta = torch.ones(batch_size, device=self.device)
+        with torch.no_grad():
+            for i in range(self.max_iters):
+                if self.nn_rhs_model.dropout_rate > 0:
+                    torch.manual_seed(seed)
+                if self.use_manual_jacobian:
+                    J, H = self._compute_J_and_residual(params, J_init, u_init, z)
+                else:
+                    J, H = torch.vmap(
+                        torch.func.jacrev(self._compute_residual, has_aux=True),
+                        randomness="different",
+                    )(params, J_init, u_init)
+                if (H.abs() < self.tol).all():
+                    break
+                if i > 0:
+                    improved = (
+                        H.square().mean(dim=-1).sqrt()
+                        < old_H.square().mean(dim=-1).sqrt()
+                    )
+                    eta = torch.where(
+                        improved,
+                        1.0,
+                        0.5 * eta,
+                    )
+                    params = torch.where(improved.unsqueeze(-1), params, old_params)
+                if self.use_sparse_solver:
+                    t_start = time.time()
+                    delta_params = -sparse_linear_solve(
+                        J, H.reshape(-1), batch_size, use_cpu_solver
+                    ).reshape(batch_size, -1)
+                    t_end = time.time()
+                    if not hasattr(self, "sparse_solve_time"):
+                        self.sparse_solve_time = 0.0
+                    self.sparse_solve_time += t_end - t_start
+                else:
+                    t_start = time.time()
+                    delta_params = -torch.linalg.solve(J, H.unsqueeze(-1)).squeeze(-1)
+                    t_end = time.time()
+                    if not hasattr(self, "dense_solve_time"):
+                        self.dense_solve_time = 0.0
+                    self.dense_solve_time += t_end - t_start
+                old_params = params.clone()
+                if i == 0:
+                    old_H = H.clone()
+                else:
+                    old_H = torch.where(improved.unsqueeze(-1), H, old_H)
+                params = params + eta.unsqueeze(-1) * delta_params
+
+        if i == self.max_iters - 1:
+            print(
+                f"Did not converge after {self.max_iters} iterations: {H.abs().max().item()}"
+            )
+            if self.use_sparse_solver and not use_cpu_solver:
+                # try again with the CPU solver, this happens sometimes with CuDSS
+                return self._timestep(J_init, u_init, z=z, use_cpu_solver=True)
+        else:
+            if self.verbose:
+                print(f"Converged after {i+1} iterations: {H.abs().max().item()}")
+        if self.nn_rhs_model.dropout_rate > 0:
+            torch.manual_seed(seed)
+        if self.use_manual_jacobian:
+            J, H = self._compute_J_and_residual(
+                params, J_init, u_init, z, is_final=True
+            )
+        else:
+            J, H = torch.vmap(
+                torch.func.jacrev(self._compute_residual, has_aux=True),
+                randomness="different",
+            )(params, J_init, u_init)
+
+        self.J = J.detach().cpu()
+
+        if self.backprop_type == "schur":
+            lhs = J
+            rhs = J @ params.unsqueeze(-1) - H.unsqueeze(-1)
+            return params, (lhs, rhs)
+        else:
+            if self.use_sparse_solver:
+                delta_params = -sparse_linear_solve(
+                    J, H.reshape(-1), batch_size, use_cpu_solver
+                ).reshape(batch_size, -1)
+                params = params + eta.unsqueeze(-1) * delta_params
+            else:
+                delta_params = -torch.linalg.solve(J, H.unsqueeze(-1)).squeeze(-1)
+                # params = torch.linalg.solve(
+                #     J, J @ params.unsqueeze(-1) - H.unsqueeze(-1)
+                # ).squeeze(-1)
+                params = params + eta.unsqueeze(-1) * delta_params
+
+        return params, (None, None)
+
+    def evolve_batch(self, batch):
+        """
+        Evolve a batch of initial conditions through time.
+
+        Args:
+            batch: Batch of data containing J_init and u_init.
+
+        Returns:
+            Tuple of (J_hat_rollout, u_hat_rollout)
+        """
+        if isinstance(batch, torch.Tensor):
+            u_init = batch
+            J_init = torch.zeros_like(u_init)
+            batch_size = u_init.shape[0]
+            z = None
+        else:
+            batch_size = batch["J_init"].shape[0]
+            J_init = batch["J_init"]
+            u_init = batch["u_init"]
+            z = batch.get("z", None)
+
+        J_hat_list = []
+        u_hat_list = []
+        lambda_1_list = []
+        lambda_2_list = []
+        lhs_list = []
+        rhs_list = []
+
+        # if hasattr(self, "include_mortars") and self.include_mortars:
+        #     u_hat_list.append(u_init.unsqueeze(1))
+
+        if hasattr(self, "model_list"):
+            self.nn_rhs_model = self.model_list[0]
+
+        params, (lhs, rhs) = self._timestep(J_init, u_init, z, self.use_cpu_solver)
+        params = params.reshape(batch_size, self.num_fields, -1).transpose(-2, -1)
+        J_hat = params[:, : self.N_t, :]
+        u_hat = params[:, self.N_t : -2, :]
+        lambda_1 = params[:, -2, :]
+        lambda_2 = params[:, -1, :]
+        u_next = lambda_2
+
+        J_hat_list.append(J_hat[:, :-1, :])
+        u_hat_list.append(u_hat)
+        lambda_1_list.append(lambda_1)
+        if hasattr(self, "include_mortars") and self.include_mortars:
+            u_hat_list.append(lambda_2.unsqueeze(1))
+        lambda_2_list.append(lambda_2)
+        lhs_list.append(lhs)
+        rhs_list.append(rhs)
+
+        for i in range(1, self.num_training_rollouts):
+            J_init = J_hat[:, -1, :]
+            u_init = u_next
+            if hasattr(self, "model_list"):
+                self.nn_rhs_model = self.model_list[i]
+            params, (lhs, rhs) = self._timestep(J_init, u_init, z, self.use_cpu_solver)
+            params = params.reshape(batch_size, self.num_fields, -1).transpose(-2, -1)
+            J_hat = params[:, : self.N_t, :]
+            u_hat = params[:, self.N_t : -2, :]
+            lambda_1 = params[:, -2, :]
+            lambda_2 = params[:, -1, :]
+            u_next = lambda_2
+
+            J_hat_list.append(J_hat[:, :-1, :])
+            u_hat_list.append(u_hat)
+            if hasattr(self, "include_mortars") and self.include_mortars:
+                u_hat_list.append(lambda_2.unsqueeze(1))
+            lambda_1_list.append(lambda_1)
+            lambda_2_list.append(lambda_2)
+            lhs_list.append(lhs)
+            rhs_list.append(rhs)
+
+        self.last_J_hat = J_hat[:, -1, :]
+        self.last_u_hat = u_next
+        self.lambda_2_list = lambda_2_list
+
+        if self.backprop_type == "schur":
+            J_hat_rollout_schur, u_hat_rollout_schur = self._schur_complement_solve(
+                batch, lhs_list, rhs_list
+            )
+            return J_hat_rollout_schur, u_hat_rollout_schur
+        else:
+            J_hat_rollout = torch.cat(J_hat_list, dim=1)
+            u_hat_rollout = torch.cat(u_hat_list, dim=1)
+
+        return J_hat_rollout, u_hat_rollout
+
+    def rollout_batch(self, batch, num_rollouts=None):
+        """
+        Perform a forward-only rollout of the batch without saving information for backpropagation.
+        This is more efficient for validation or inference where gradients are not needed.
+
+        Args:
+            batch: Batch of data containing J_init and u_init.
+            num_rollouts: Optional number of rollouts to perform.
+                          Defaults to self.num_training_rollouts if None.
+
+        Returns:
+            The evolved *J_hat_rollout, u_hat_rollout)
+        """
+        with torch.no_grad():
+            # Store original values
+            original_backprop_type = self.backprop_type
+            original_num_training_rollouts = self.num_training_rollouts
+
+            # Set temporary values
+            self.backprop_type = "matrix_free"
+            if num_rollouts is not None:
+                self.num_training_rollouts = num_rollouts
+
+            try:
+                # Use the existing evolve_batch function
+                J_hat_rollout, u_hat_rollout = self.evolve_batch(batch)
+                return J_hat_rollout, u_hat_rollout
+            finally:
+                # Restore original values (even if an exception occurs)
+                self.backprop_type = original_backprop_type
+                self.num_training_rollouts = original_num_training_rollouts
+
+    def _compute_permutation_indices(self):
+        """
+        Compute permutation indices for the system.
+
+        Returns:
+            A tuple (permutation_indices_without_lambdas, permutation_indices) of indices.
+        """
+        # first, find the indices of the lambdas
+        lambda_indices = torch.tensor(
+            [
+                [
+                    field_ndx * (self.N_t + (self.N_t - 1) + 2) - 2,
+                    field_ndx * (self.N_t + (self.N_t - 1) + 2) - 1,
+                ]
+                for field_ndx in range(1, self.num_fields + 1)
+            ],
+            dtype=torch.long,
+        ).flatten()
+        # next, deinterleave the indices: lambda_1s are first, then the lambda_2s
+        tmp = lambda_indices.clone()
+        (
+            tmp[: tmp.shape[0] // 2],
+            tmp[tmp.shape[0] // 2 :],
+        ) = (
+            lambda_indices[::2],
+            lambda_indices[1::2],
+        )
+        lambda_indices = tmp
+        # build up permutation indices:
+        permutation_indices = [
+            i for i in range(self.A.shape[0]) if i not in lambda_indices
+        ]
+        permutation_indices_without_lambdas = torch.tensor(
+            permutation_indices, dtype=torch.long
+        )
+        permutation_indices = torch.cat(
+            [
+                permutation_indices_without_lambdas,
+                lambda_indices,
+            ]
+        )
+        return permutation_indices_without_lambdas.to(
+            self.device
+        ), permutation_indices.to(self.device)
+
+    def _compute_B(self):
+        """
+        Compute the B matrix for the Schur complement method.
+
+        Returns:
+            The computed B matrix.
+        """
+        B = self.A[self.permutation_indices, :][:, self.permutation_indices]
+        B = B[: self.num_fields * (self.N_t + (self.N_t - 1)), :][
+            :, self.num_fields * (self.N_t + (self.N_t - 1)) :
+        ]
+        B = torch.kron(torch.eye(self.num_training_rollouts, device=self.device), B)
+        return B.to(torch.float64)
+
+    def _compute_C(self):
+        """
+        Compute the C matrix for the Schur complement method.
+
+        Returns:
+            The computed C matrix.
+        """
+        J_hat_init_indices = torch.zeros(
+            self.N_t + (self.N_t - 1) + 2,
+            self.num_fields,
+            dtype=torch.long,
+            device=self.device,
+        )
+        J_hat_init_indices[0, :] = 1
+        J_hat_init_indices = (
+            J_hat_init_indices.T.reshape(-1)[self.permutation_indices]
+            .nonzero()
+            .squeeze()
+        )
+        J_hat_last_indices = torch.zeros(
+            self.N_t + (self.N_t - 1) + 2,
+            self.num_fields,
+            dtype=torch.long,
+            device=self.device,
+        )
+        J_hat_last_indices[self.N_t - 1, :] = 1
+        J_hat_last_indices = (
+            J_hat_last_indices.T.reshape(-1)[self.permutation_indices]
+            .nonzero()
+            .squeeze()
+        )
+
+        row_indices_list = []
+        col_indices_list = []
+        values_list = []
+        for rollout_ndx in range(self.num_training_rollouts):
+            row_offset = rollout_ndx * 2 * self.num_fields
+            row_indices = row_offset + torch.arange(self.num_fields, device=self.device)
+            if rollout_ndx == 0:
+                col_indices = J_hat_init_indices
+                values = torch.ones_like(col_indices)
+                row_indices_list.append(row_indices)
+                col_indices_list.append(col_indices)
+                values_list.append(values)
+                continue
+            col_offset_current = (
+                self.num_fields * (self.N_t + (self.N_t - 1)) * rollout_ndx
+            )
+            col_offset_last = (
+                self.num_fields * (self.N_t + (self.N_t - 1)) * (rollout_ndx - 1)
+            )
+            col_indices = col_offset_last + J_hat_last_indices
+            values = -torch.ones_like(col_indices)
+            row_indices_list.append(row_indices)
+            col_indices_list.append(col_indices)
+            values_list.append(values)
+            col_indices = col_offset_current + J_hat_init_indices
+            values = torch.ones_like(col_indices)
+            row_indices_list.append(row_indices)
+            col_indices_list.append(col_indices)
+            values = torch.ones_like(col_indices)
+            values_list.append(values)
+        row_indices = torch.cat(row_indices_list)
+        if self.num_fields == 1:
+            col_indices = torch.stack(col_indices_list)
+        else:
+            col_indices = torch.cat(col_indices_list)
+        if self.num_fields == 1:
+            values = torch.stack(values_list)
+        else:
+            values = torch.cat(values_list)
+        C = torch.sparse_coo_tensor(
+            torch.stack([row_indices, col_indices]),
+            values,
+            size=(
+                self.num_training_rollouts * 2 * self.num_fields,
+                self.num_training_rollouts
+                * self.num_fields
+                * (self.N_t + (self.N_t - 1)),
+            ),
+        ).to(self.device)
+        return C.to_dense().to(torch.float64)
+
+    def _compute_D(self):
+        """
+        Compute the D matrix for the Schur complement method.
+
+        Returns:
+            The computed D matrix.
+        """
+        lambda_1_indices = torch.arange(self.num_fields)
+        lambda_2_indices = torch.arange(self.num_fields) + self.num_fields
+        row_indices_list = []
+        col_indices_list = []
+        values_list = []
+        for rollout_ndx in range(self.num_training_rollouts):
+            row_offset = rollout_ndx * 2 * self.num_fields
+            row_indices = row_offset + lambda_2_indices
+            if rollout_ndx == 0:
+                col_indices = lambda_1_indices
+                values = torch.ones_like(col_indices)
+                row_indices_list.append(row_indices)
+                col_indices_list.append(col_indices)
+                values_list.append(values)
+                continue
+            col_offset_current = 2 * self.num_fields * rollout_ndx
+            col_offset_last = 2 * self.num_fields * (rollout_ndx - 1)
+            col_indices = col_offset_last + lambda_2_indices
+            values = -torch.ones_like(col_indices)
+            row_indices_list.append(row_indices)
+            col_indices_list.append(col_indices)
+            values_list.append(values)
+            col_indices = col_offset_current + lambda_1_indices
+            values = torch.ones_like(col_indices)
+            row_indices_list.append(row_indices)
+            col_indices_list.append(col_indices)
+            values_list.append(values)
+        row_indices = torch.cat(row_indices_list)
+        col_indices = torch.cat(col_indices_list)
+        values = torch.cat(values_list)
+        D = torch.sparse_coo_tensor(
+            torch.stack([row_indices, col_indices]),
+            values,
+            size=(
+                self.num_training_rollouts * 2 * self.num_fields,
+                self.num_training_rollouts * 2 * self.num_fields,
+            ),
+        ).to(self.device)
+        return D.to_dense().to(torch.float64)
+
+    def _schur_complement_solve(self, batch, lhs_list, rhs_list):
+        """
+        Solve the system using the Schur complement method.
+
+        Args:
+            batch: Batch of data containing J_init and u_init.
+            lhs_list: List of left-hand sides of the linear systems.
+            rhs_list: List of right-hand sides of the linear systems.
+
+        Returns:
+            The computed u_hat_rollout.
+        """
+        # Infer batch size from input
+        batch_size = batch["J_init"].shape[0]
+
+        self.lhs_list = lhs_list
+
+        lhs = torch.stack(lhs_list).transpose(0, 1)[
+            ..., self.permutation_indices_without_lambdas, :
+        ][
+            ..., self.permutation_indices_without_lambdas
+        ]  # batch_ndx, time_ndx, matrix
+        rhs = (
+            torch.stack(rhs_list)
+            .transpose(0, 1)[..., self.permutation_indices_without_lambdas, :]
+            .squeeze(-1)
+        )
+        u = rhs.reshape(batch_size, -1, 1)
+        inits = torch.cat([batch["J_init"], batch["u_init"]], dim=-1)
+        v = torch.zeros(batch_size, self.num_training_rollouts * 2 * self.num_fields)
+        v[:, : inits.shape[1]] = inits
+        v = v.to(self.device)
+        v = v.unsqueeze(-1)
+        A_inv = torch.linalg.inv(lhs)
+        A_inv = torch.vmap(lambda X: torch.block_diag(*X))(A_inv)
+        S = self.D - self.C @ A_inv @ self.B
+        S_inv = torch.linalg.inv(S)
+        y = S_inv @ (v - self.C @ A_inv @ u)
+        x = A_inv @ (u - self.B @ y)
+        J_hat_rollout = (
+            x.squeeze(-1)
+            .reshape(batch_size, self.num_training_rollouts, self.num_fields, -1)[
+                :, :, :, : self.N_t - 1
+            ]
+            .transpose(-2, -1)
+        ).reshape(batch_size, -1, self.num_fields)
+        u_hat_rollout = (
+            x.squeeze(-1)
+            .reshape(batch_size, self.num_training_rollouts, self.num_fields, -1)[
+                :, :, :, self.N_t :
+            ]
+            .transpose(-2, -1)
+        ).reshape(batch_size, -1, self.num_fields)
+        return J_hat_rollout, u_hat_rollout
