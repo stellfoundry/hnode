@@ -357,6 +357,23 @@ class HybridNODESolver:
     def _build_indexers(self, batch_size):
         N = self.N_t + (self.N_t - 1) + 2
 
+        if not self.use_sparse_solver:
+            # Dense path: only the flat scatter indices are used. Build them with
+            # broadcasting, in the same (batch, row field, col field, cell) order
+            # as the loops below; the loops launch several small GPU ops per
+            # (batch, field, field) and take hours for batches of ~600 with 64
+            # fields.
+            F, n_t, FN = self.num_fields, self.N_t, self.num_fields * N
+            b = torch.arange(batch_size, device=self.device).view(-1, 1, 1, 1)
+            rf = torch.arange(F, device=self.device).view(1, -1, 1, 1)
+            cf = torch.arange(F, device=self.device).view(1, 1, -1, 1)
+            c = torch.arange(n_t - 1, device=self.device).view(1, 1, 1, -1)
+            row = b * FN * FN + (rf * N + n_t + c) * FN
+            self.u_hat_u_hat_indices = (row + cf * N + n_t + c).reshape(-1)
+            self.u_hat_J_hat_left_indices = (row + cf * N + c).reshape(-1)
+            self.u_hat_J_hat_right_indices = (row + cf * N + 1 + c).reshape(-1)
+            return
+
         index_matrix = torch.arange(
             batch_size * self.num_fields * N * self.num_fields * N, device=self.device
         ).reshape(batch_size, self.num_fields * N, self.num_fields * N)
@@ -643,6 +660,40 @@ class HybridNODESolver:
 
         return J, residual
 
+    def _dense_solve(self, J, rhs):
+        """
+        Solve the batched dense system J x = rhs, re-solving failed batch elements on CPU.
+
+        Some GPU backends (observed with hipSOLVER on ROCm) spuriously report
+        well-conditioned matrices as singular or return non-finite solutions.
+
+        Args:
+            J: Batched matrices of shape (batch, n, n).
+            rhs: Right-hand sides of shape (batch, n, 1).
+
+        Returns:
+            The solution x of shape (batch, n, 1).
+        """
+        x, info = torch.linalg.solve_ex(J, rhs)
+        bad = (info != 0) | ~torch.isfinite(x).flatten(1).all(dim=-1)
+        if bad.any():
+            if not hasattr(self, "dense_solve_fallbacks"):
+                self.dense_solve_fallbacks = 0
+            self.dense_solve_fallbacks += int(bad.sum())
+            print(
+                f"Dense solve failed on {J.device} for batch elements "
+                f"{bad.nonzero().flatten().tolist()} (info={info[bad].tolist()}); "
+                f"re-solving on CPU (total fallbacks: {self.dense_solve_fallbacks})"
+            )
+            # Rebuild x from scratch: keeping the failed solve in the autograd
+            # graph would leak NaNs into the gradients even after overwriting it.
+            good = ~bad
+            x = torch.zeros_like(rhs)
+            if good.any():
+                x[good] = torch.linalg.solve(J[good], rhs[good])
+            x[bad] = torch.linalg.solve(J[bad].cpu(), rhs[bad].cpu()).to(J.device)
+        return x
+
     def _timestep(self, J_init, u_init, z=None, use_cpu_solver=False):
         """
         Perform a single timestep of the system.
@@ -696,7 +747,7 @@ class HybridNODESolver:
                     self.sparse_solve_time += t_end - t_start
                 else:
                     t_start = time.time()
-                    delta_params = -torch.linalg.solve(J, H.unsqueeze(-1)).squeeze(-1)
+                    delta_params = -self._dense_solve(J, H.unsqueeze(-1)).squeeze(-1)
                     t_end = time.time()
                     if not hasattr(self, "dense_solve_time"):
                         self.dense_solve_time = 0.0
@@ -730,7 +781,11 @@ class HybridNODESolver:
                 randomness="different",
             )(params, J_init, u_init)
 
-        self.J = J.detach().cpu()
+        # Host copy of the last Jacobian (batch * (F*(2*N_t+1))^2 * 8 bytes per
+        # window); callers that never read self.J can set
+        # store_last_jacobian = False to skip it.
+        if getattr(self, "store_last_jacobian", True):
+            self.J = J.detach().cpu()
 
         if self.backprop_type == "schur":
             lhs = J
@@ -743,7 +798,7 @@ class HybridNODESolver:
                 ).reshape(batch_size, -1)
                 params = params + eta.unsqueeze(-1) * delta_params
             else:
-                delta_params = -torch.linalg.solve(J, H.unsqueeze(-1)).squeeze(-1)
+                delta_params = -self._dense_solve(J, H.unsqueeze(-1)).squeeze(-1)
                 # params = torch.linalg.solve(
                 #     J, J @ params.unsqueeze(-1) - H.unsqueeze(-1)
                 # ).squeeze(-1)
