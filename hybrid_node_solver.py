@@ -31,6 +31,7 @@ class HybridNODESolver:
         use_sparse_solver=True,
         use_cpu_solver=False,
         device=None,
+        linear_solver="dense",
     ):
         """
         Initialize the HybridNODESolver.
@@ -49,6 +50,14 @@ class HybridNODESolver:
             use_sparse_solver: Whether to use a sparse solver for linear systems.
             use_cpu_solver: Whether to use CPU solver for sparse linear systems.
             device: Device to run computations on (default is CUDA if available).
+            linear_solver: How the dense-path Newton systems are solved. "dense" (default):
+                build the full Jacobian and use one batched LU. "block": never build the
+                full n x n matrices; keep the per-field A block and the network's per-cell
+                Jacobian blocks, and solve by marching cell by cell (the Jacobian is block
+                lower-triangular in time). Same result to round-off; much less memory for
+                large num_fields or N_t. Requires matrix_free backprop, the manual Jacobian
+                and use_sparse_solver=False; self.A, self.A_inv and self.exp_M_p0 do not
+                exist in block mode (use apply_A for A @ params).
 
         """
         self.nn_rhs_model = nn_rhs_model
@@ -63,6 +72,16 @@ class HybridNODESolver:
         self.use_manual_jacobian = use_manual_jacobian
         self.use_sparse_solver = use_sparse_solver
         self.use_cpu_solver = use_cpu_solver
+        self.linear_solver = linear_solver
+
+        if self.linear_solver not in ("dense", "block"):
+            raise ValueError(f"linear_solver must be 'dense' or 'block', got {linear_solver!r}")
+        if self.linear_solver == "block":
+            assert (
+                self.backprop_type == "matrix_free"
+                and self.use_manual_jacobian
+                and not self.use_sparse_solver
+            ), "linear_solver='block' requires matrix_free backprop, the manual Jacobian and use_sparse_solver=False"
 
         if self.use_manual_jacobian:
             assert (
@@ -81,10 +100,13 @@ class HybridNODESolver:
         else:
             self.device = device
 
-        self.A, self.M_p0, self.exp_M_p0 = self._build_A_and_M_p0()
+        if self.linear_solver == "block":
+            self._build_block_system()
+        else:
+            self.A, self.M_p0, self.exp_M_p0 = self._build_A_and_M_p0()
 
-        # Cache A_inv for quick initialization of params during solve
-        self.A_inv = torch.linalg.inv(self.A)
+            # Cache A_inv for quick initialization of params during solve
+            self.A_inv = torch.linalg.inv(self.A)
 
         if self.backprop_type == "schur":
             # Compute permutation indices
@@ -255,12 +277,14 @@ class HybridNODESolver:
         # Coalesce to combine any duplicate indices (shouldn't happen, but good practice)
         return C.coalesce()
 
-    def _build_A_and_M_p0(self):
+    def _build_A_per_field(self):
         """
-        Build the A matrix and M_p0 matrix used for rollouts.
+        Build the per-field block of A (size 2*N_t+1) and the P0 mass matrix M_p0.
+
+        A itself is kron(I_num_fields, A_per_field).
 
         Returns:
-            A tuple (A, M_p0) of matrices.
+            A tuple (A_per_field, M_p0) of dense float64 matrices on the CPU.
         """
         with torch.no_grad():
             mesh = skfem.MeshLine(np.linspace(0.0, self.delta_t, self.N_t))
@@ -333,6 +357,18 @@ class HybridNODESolver:
             A[-1, :] = 0.0
             A[-1, -2] = 1.0
 
+            return A, M_p0
+
+    def _build_A_and_M_p0(self):
+        """
+        Build the A matrix and M_p0 matrix used for rollouts.
+
+        Returns:
+            A tuple (A, M_p0) of matrices.
+        """
+        with torch.no_grad():
+            A, M_p0 = self._build_A_per_field()
+
             A = torch.kron(torch.eye(self.num_fields, device=A.device), A)
 
             N = A.shape[0] // self.num_fields
@@ -353,6 +389,131 @@ class HybridNODESolver:
             self.exp_M_p0_sparse = exp_M_p0.to_sparse_coo().to(self.device)
 
             return A.to(self.device), M_p0.to(self.device), exp_M_p0.to(self.device)
+
+    def _build_block_system(self):
+        """
+        Set up linear_solver="block": the per-field A block, the cell sizes, and the slab layout.
+
+        Grouping unknowns and equations by time makes the window's Jacobian block
+        lower-triangular:
+            slab "init":  unknowns (lambda_1, J_0)   <- rows (lambda_1 = u_init, J(0) = J_init)
+            slab k:       unknowns (u_k, J_{k+1})    <- rows (node row k, cell row k), k = 0..M-1
+            slab "final": unknown  lambda_2          <- row  node row M
+        Rows of slab k touch only slabs k, k-1 and k-2 (and "init" for k <= 1); the final row
+        touches the last two cell slabs. Within a slab, unknowns and rows are ordered
+        (local index, field), so the A part of every block is kron(A_per_field[rows, cols], I_F).
+        """
+        A_pf, M_p0 = self._build_A_per_field()
+        off_diagonal = M_p0 - torch.diag(M_p0.diagonal())
+        assert off_diagonal.abs().max() == 0, "block solver assumes a diagonal P0 mass matrix"
+        F, N_t = self.num_fields, self.N_t
+        M, P = N_t - 1, 2 * N_t + 1
+        dev = self.device
+
+        self.A_per_field = A_pf.to(dev)
+        self.A_per_field_inv = torch.linalg.inv(A_pf).to(dev)  # small (P x P), inverted on the CPU
+        self.M_p0 = M_p0.to(dev)
+        self.cell_sizes = M_p0.diagonal().to(dev)  # h_k: M_p0 is diag(h)
+
+        # Local (per-field) row and column indices of every slab, and its dependencies.
+        slabs = [{"rows": [2 * N_t, 2 * N_t - 1], "cols": [2 * N_t - 1, 0], "deps": []}]
+        for k in range(M):
+            deps = [0] if k <= 1 else []
+            deps += [1 + j for j in (k - 2, k - 1) if j >= 0]
+            slabs.append({"rows": [k, N_t + k], "cols": [N_t + k, k + 1], "deps": deps})
+        slabs.append({"rows": [M], "cols": [2 * N_t], "deps": [1 + j for j in (M - 2, M - 1) if j >= 0]})
+
+        eye_F = torch.eye(F, dtype=torch.float64)
+        fields = torch.arange(F) * P
+
+        def a_block(rows, cols):
+            return torch.kron(A_pf[rows][:, cols], eye_F).to(dev)
+
+        def global_index(locals_):
+            return torch.cat([fields + q for q in locals_]).to(dev)
+
+        for s in slabs:
+            s["row_index"] = global_index(s["rows"])
+            s["col_index"] = global_index(s["cols"])
+            s["A_diag"] = a_block(s["rows"], s["cols"])
+            s["A_deps"] = {d: a_block(s["rows"], slabs[d]["cols"]) for d in s["deps"]}
+        perm = torch.cat([s["col_index"] for s in slabs])
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.numel(), device=dev)
+        self._slabs = slabs
+        self._slab_inv_perm = inv_perm
+
+    def apply_A(self, params):
+        """A @ params for params of shape (batch, n), in either linear_solver mode."""
+        if self.linear_solver == "block":
+            batch_size = params.shape[0]
+            x = params.reshape(batch_size, self.num_fields, -1)
+            return torch.einsum("ij,bfj->bfi", self.A_per_field, x).reshape(batch_size, -1)
+        return (self.A @ params.unsqueeze(-1)).squeeze(-1)
+
+    def _compute_block_J_and_residual(self, params, J_init, u_init, z=None):
+        """linear_solver="block" version of _compute_J_and_residual: returns the Jacobian as
+        per-slab blocks (a _BlockJacobian) instead of a dense (batch, n, n) tensor."""
+        batch_size = params.shape[0]
+        params_reshaped = params.reshape(batch_size, self.num_fields, -1).transpose(
+            -2, -1
+        )
+        J_hat = params_reshaped[:, : self.N_t, :]
+        u_hat = params_reshaped[:, self.N_t : -2, :]
+
+        t_start = time.time()
+        (u_hat_jacobian, z_jacobians), u_hat_forcing = self.nn_rhs_model(
+            J_hat, u_hat, z
+        )
+        t_end = time.time()
+        if not hasattr(self, "nn_time"):
+            self.nn_time = 0.0
+        self.nn_time += t_end - t_start
+
+        linear_part = self.apply_A(params)
+        nonlinear_part = self.M_p0 @ u_hat_forcing
+        nonlinear_part = (
+            torch.cat(
+                [
+                    torch.zeros_like(J_hat),
+                    nonlinear_part,
+                    torch.zeros(batch_size, 2, self.num_fields, device=self.device),
+                ],
+                dim=1,
+            )
+            .transpose(-2, -1)
+            .reshape(batch_size, -1)
+        )
+        residual = linear_part + nonlinear_part
+        rhs = torch.cat(
+            [
+                torch.zeros(
+                    batch_size,
+                    params_reshaped.shape[1] - 2,
+                    self.num_fields,
+                    device=self.device,
+                ),
+                J_init.unsqueeze(1),
+                u_init.unsqueeze(1),
+            ],
+            dim=1,
+        )
+        residual = residual - rhs.transpose(-2, -1).reshape(batch_size, -1)
+
+        # Network Jacobian blocks enter only the cell rows, scaled by the cell size:
+        #   cell row k: + h_k dN_k/du_k (cols u_k), + h_k dN_k/dJ_{k+1} (cols J_{k+1}),
+        #               + h_k dN_k/dJ_k (cols J_k, held by the previous slab).
+        h = self.cell_sizes.view(1, -1, 1, 1)
+        d_u = h * u_hat_jacobian  # (batch, M, F, F): [out field, in field]
+        d_left = h * z_jacobians[:, :, :, 0, :]
+        d_right = h * z_jacobians[:, :, :, 1, :]
+        return _BlockJacobian(self, d_u, d_left, d_right), residual
+
+    def _solve(self, J, H):
+        """Newton step solve J x = H, dispatching on linear_solver."""
+        if self.linear_solver == "block":
+            return J.solve(H)
+        return self._dense_solve(J, H.unsqueeze(-1)).squeeze(-1)
 
     def _build_indexers(self, batch_size):
         N = self.N_t + (self.N_t - 1) + 2
@@ -482,6 +643,11 @@ class HybridNODESolver:
         )
         rhs[:, -2, :] = J_init
         rhs[:, -1, :] = u_init
+        if self.linear_solver == "block":
+            # A = kron(I, A_per_field): solve field by field.
+            return (self.A_per_field_inv @ rhs.transpose(-2, -1).unsqueeze(-1)).reshape(
+                batch_size, -1
+            )
         return (self.A_inv @ rhs.transpose(-2, -1).reshape(batch_size, -1, 1)).squeeze(
             -1
         )
@@ -543,6 +709,8 @@ class HybridNODESolver:
         Returns:
             A tuple (Jacobian, residual).
         """
+        if self.linear_solver == "block":
+            return self._compute_block_J_and_residual(params, J_init, u_init, z)
         batch_size = params.shape[0]
         params_reshaped = params.reshape(batch_size, self.num_fields, -1).transpose(
             -2, -1
@@ -747,7 +915,7 @@ class HybridNODESolver:
                     self.sparse_solve_time += t_end - t_start
                 else:
                     t_start = time.time()
-                    delta_params = -self._dense_solve(J, H.unsqueeze(-1)).squeeze(-1)
+                    delta_params = -self._solve(J, H)
                     t_end = time.time()
                     if not hasattr(self, "dense_solve_time"):
                         self.dense_solve_time = 0.0
@@ -784,7 +952,8 @@ class HybridNODESolver:
         # Host copy of the last Jacobian (batch * (F*(2*N_t+1))^2 * 8 bytes per
         # window); callers that never read self.J can set
         # store_last_jacobian = False to skip it.
-        if getattr(self, "store_last_jacobian", True):
+        # (Not stored in block mode, where J is a set of per-slab blocks.)
+        if getattr(self, "store_last_jacobian", True) and self.linear_solver == "dense":
             self.J = J.detach().cpu()
 
         if self.backprop_type == "schur":
@@ -798,7 +967,7 @@ class HybridNODESolver:
                 ).reshape(batch_size, -1)
                 params = params + eta.unsqueeze(-1) * delta_params
             else:
-                delta_params = -self._dense_solve(J, H.unsqueeze(-1)).squeeze(-1)
+                delta_params = -self._solve(J, H)
                 # params = torch.linalg.solve(
                 #     J, J @ params.unsqueeze(-1) - H.unsqueeze(-1)
                 # ).squeeze(-1)
@@ -1169,3 +1338,52 @@ class HybridNODESolver:
             .transpose(-2, -1)
         ).reshape(batch_size, -1, self.num_fields)
         return J_hat_rollout, u_hat_rollout
+
+
+class _BlockJacobian:
+    """A window's Newton Jacobian for linear_solver="block", kept as per-slab blocks.
+
+    The constant part comes from HybridNODESolver._build_block_system (A blocks); the network
+    part is the per-cell Jacobians scaled by the cell size (h_k dN_k/du_k, dN_k/dJ_k,
+    dN_k/dJ_{k+1}), each (batch, M, F, F). solve() does block forward substitution in time;
+    it is built from differentiable torch ops, so the final Newton step backpropagates as in
+    the dense path.
+    """
+
+    def __init__(self, solver, d_u, d_left, d_right):
+        self.solver = solver
+        self.d_u = d_u
+        self.d_left = d_left
+        self.d_right = d_right
+
+    def _cell_rows_block(self, left, right):
+        """(batch, 2F, 2F) block that is zero in the node rows and [left | right] in the cell rows."""
+        top = torch.zeros(
+            left.shape[0], left.shape[1], 2 * left.shape[2], dtype=left.dtype, device=left.device
+        )
+        return torch.cat([top, torch.cat([left, right], dim=-1)], dim=1)
+
+    def solve(self, H):
+        s = self.solver
+        slabs = s._slabs
+        batch_size = H.shape[0]
+        n_slabs = len(slabs)
+        Y = []
+        for i, slab in enumerate(slabs):
+            is_cell = 1 <= i <= n_slabs - 2
+            k = i - 1  # cell index of a cell slab
+            r = H[:, slab["row_index"]]
+            for d in slab["deps"]:
+                block = slab["A_deps"][d]
+                if is_cell and d == i - 1:
+                    # The previous slab holds J_k (its second column group).
+                    zeros = torch.zeros_like(self.d_left[:, k])
+                    block = block + self._cell_rows_block(zeros, self.d_left[:, k])
+                r = r - (block @ Y[d].unsqueeze(-1)).squeeze(-1)
+            D = slab["A_diag"]
+            if is_cell:
+                D = D + self._cell_rows_block(self.d_u[:, k], self.d_right[:, k])
+            else:
+                D = D.expand(batch_size, -1, -1)
+            Y.append(s._dense_solve(D, r.unsqueeze(-1)).squeeze(-1))
+        return torch.cat(Y, dim=1)[:, s._slab_inv_perm]
