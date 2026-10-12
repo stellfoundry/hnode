@@ -298,12 +298,18 @@ class CrossAttnTransformer(nn.Module):
 
         if z is None:
             (u_hat_jacobian, z_jacobians), u_hat_forcing = torch.vmap(
-                torch.func.jacrev(internal_forward, has_aux=True, argnums=(0, 1)),
+                torch.func.jacrev(
+                    internal_forward, has_aux=True, argnums=(0, 1),
+                    chunk_size=getattr(self, "jacobian_chunk_size", None),  # None: all rows at once
+                ),
                 randomness="different",
             )(u_hat, z_tokens)
         else:
             (u_hat_jacobian, z_jacobians), u_hat_forcing = torch.vmap(
-                torch.func.jacrev(internal_forward, has_aux=True, argnums=(0, 1)),
+                torch.func.jacrev(
+                    internal_forward, has_aux=True, argnums=(0, 1),
+                    chunk_size=getattr(self, "jacobian_chunk_size", None),  # None: all rows at once
+                ),
                 randomness="different",
             )(u_hat, z_tokens, z)
 

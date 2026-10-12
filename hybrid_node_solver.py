@@ -891,7 +891,12 @@ class HybridNODESolver:
                         torch.func.jacrev(self._compute_residual, has_aux=True),
                         randomness="different",
                     )(params, J_init, u_init)
-                if (H.abs() < self.tol).all():
+                tol = self.tol
+                if getattr(self, "relative_tol", False):
+                    # Optional: scale the tolerance with the state, whose size sets the residual's
+                    # rounding floor (states of ~1e4 cannot reach an absolute 1e-12).
+                    tol = self.tol * max(1.0, params.abs().max().item())
+                if (H.abs() < tol).all():
                     break
                 if i > 0:
                     improved = (
@@ -948,6 +953,13 @@ class HybridNODESolver:
                 torch.func.jacrev(self._compute_residual, has_aux=True),
                 randomness="different",
             )(params, J_init, u_init)
+
+        # Optional: drop the autograd graph through the final step's Jacobian. The IFT gradient
+        # of params = params - J^-1 H is -J^-1 dH/dtheta - d(J^-1) H; at convergence |H| < tol,
+        # so the second term is negligible while its graph (a backward pass through the
+        # network's jacrev, kept for every window) dominates training memory at large F.
+        if getattr(self, "detach_final_jacobian", False):
+            J = J.detach() if isinstance(J, torch.Tensor) else J.detached()
 
         # Host copy of the last Jacobian (batch * (F*(2*N_t+1))^2 * 8 bytes per
         # window); callers that never read self.J can set
@@ -1355,6 +1367,10 @@ class _BlockJacobian:
         self.d_u = d_u
         self.d_left = d_left
         self.d_right = d_right
+
+    def detached(self):
+        """The same Jacobian without its autograd graph."""
+        return _BlockJacobian(self.solver, self.d_u.detach(), self.d_left.detach(), self.d_right.detach())
 
     def _cell_rows_block(self, left, right):
         """(batch, 2F, 2F) block that is zero in the node rows and [left | right] in the cell rows."""
