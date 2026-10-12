@@ -85,7 +85,8 @@ For PDE data, a Swin-V2 encoder and decoder map fields to a 64-dimensional laten
 `2·N_t + 1` unknowns in total. For Lorenz (`N_t = 11`, 3 fields) that is a dense 69×69
 system per batch item.
 
-The block system built in `_build_A_and_M_p0` (four blocks of rows):
+The per-field system built in `_build_A_per_field` (four blocks of rows; `_build_A_and_M_p0`
+then forms the full A = kron(I_F, ·) in dense mode):
 
     block 1 (N_t rows):     M_rt·J + Gᵀ·u + C1·λ₁ + C2·λ₂ = 0    (J = du/dt weakly; λ are the u traces)
     block 2 (N_t − 1 rows): G·J + M_p0·N(J, u)          = 0    (dJ/dt = −N; the sign is flipped from the paper)
@@ -99,8 +100,10 @@ window's `u_init` and `J_init` (see `evolve_batch`).
 1. Build the residual `H = A·params + M·N_θ(params) − b`.
 2. Build the Jacobian `A + M·∂N_θ/∂params`. The network computes its own input-Jacobian with
    `vmap(jacrev)`, and the result is block-sparse because each cell depends only on its
-   neighbours. `_build_indexers` scatters those blocks into the full matrix.
-3. Run damped Newton, halving the step if the residual grows, until the residual is below `1e-12`.
+   neighbours. In dense mode, `_build_indexers` scatters those blocks into the full matrix; in
+   block mode (`linear_solver="block"`) they are kept as per-cell blocks.
+3. Run damped Newton, halving the step if the residual grows, until the residual is below `1e-12`
+   (optionally relative to the state size: `relative_tol`, see "Large latent dimensions").
 
 ### Backward pass
 - `backprop_type="matrix_free"` (the default in the examples): the Newton loop runs under
@@ -120,7 +123,7 @@ and time is rescaled by `t_scale` so that J has unit variance.
 
 | Paper concept | Code |
 |---|---|
-| The weak form: finite-element matrices for (J, v), (u, v′) and (J′, q) | `_build_A_and_M_p0`, which builds `M_rt`, `G`, `M_p0` with scikit-fem |
+| The weak form: finite-element matrices for (J, v), (u, v′) and (J′, q) | `_build_A_per_field`, which builds `M_rt`, `G`, `M_p0` with scikit-fem |
 | λ multipliers and continuity between windows | The last two unknowns per field; `u_next = lambda_2`, `J_init = J_hat[:, -1]` in `evolve_batch` |
 | Local transformer N | `CrossAttnTransformer.forward` in `neural_networks.py`: 3 tokens (J_left, u, J_right), Jacobian from `vmap(jacrev)` |
 | Newton solve of H = 0 | `_timestep` (damped Newton) and `_compute_J_and_residual` |
@@ -131,12 +134,26 @@ and time is rescaled by `t_scale` so that J has unit variance.
 
 | File | Role |
 |---|---|
-| `hybrid_node_solver.py` | Core: the finite-element matrices, Newton solve, rollout, and Schur-complement backprop |
+| `hybrid_node_solver.py` | Core: the finite-element matrices, Newton solve (dense or block linear solve), rollout, and Schur-complement backprop |
 | `neural_networks.py` | `CrossAttnTransformer`, the per-cell N_θ and its Jacobian |
 | `ode_datasets.py`, `pca_datasets.py` | Data sampled on the staggered node/midpoint grid |
 | `01_lorenz.py` | Simplest case: the 3-D state is used directly (start here) |
 | `02_flow_past_cylinder.py` | State is 64 PCA modes, conditioned on `z = log(Re)` |
 | `03_shear_flow.py`, `04_plasma_gun.ipynb` | A Swin-V2 encoder/decoder maps fields to a latent space; HNODE runs there, trained end to end |
+| `03_shear_flow_ddp.py`, `run_shear_flow_ddp.sh` | Data-parallel shear-flow training on Frontier, reading The Well HDF5 files; `MODE=grad_check` and `MODE=eval` check modes |
+| `run_shear_flow_repro.sh` | Training from scratch in 24-hour jobs (`-p extended`) that resume from the last checkpoint; see "Training from scratch vs the reference checkpoint" |
+| `soap.py` | The SOAP optimizer; on ROCm its GPU QR/eigh results are checked and recomputed on the CPU when wrong (see "Platform note: SOAP's QR on ROCm") |
+| `solver_backends.py`, `test_solver_backends.py`, `test_block_mode.py` | Linear-solver comparison harness and the tests for `linear_solver="block"` |
+| `shear_flow_common.py` | Helpers shared by the latent-space scripts below (devices, frame statistics, The Well splits, loading the pretrained models) |
+| `pod_basis.py`, `run_pod_basis.sh` | POD basis of shear flow (1,024 modes, distributed method of snapshots), the coefficients of every frame and the projection floor (`hnode_runs/pod/full/`) |
+| `ae_train.py` | Two-stage autoencoders (`cnn` or `swin`) trained on frames, and `encode` to write their latents |
+| `encode_latents.py` | Latents of every frame from the frozen pretrained Swin encoder, plus the reference HNODE rollout |
+| `latent_baselines.py` | Time steppers in a frozen latent space: `hnode`, `node1`, `node2`, `lstm`, `koopman`, `dmd`, all trained the same way; see "Large latent dimensions" for the HNODE settings |
+| `eval_latent_rollout.py` | Decodes any latent rollout (`DECODER=swin`, `pod:R` or `ae:CKPT`) and scores it like `MODE=eval`; `compare` plots several |
+| `run_latent_job.sh`, `submit_latent_row.sh`, `submit_ae.sh` | Slurm launchers: one "row" = every time stepper on one latent space, then the evaluation |
+| `profile_latent_dim.py`, `run_profile_latent_dim.sh` | Time and memory of HNODE vs latent dimension F (64–1024) and solver options; see "Large latent dimensions" |
+| `summarize_latent_dim.py` | VRMSE versus latent dimension for every row and HNODE scaling (`hnode_runs/rows/latent_dim_vrmse.png`) |
+| `spectral_energy.py` | Kinetic-energy spectra versus time of every row and the Swin models (`compute` on 8 GPUs, then `plot`); see "Does a larger latent dimension help HNODE?" |
 
 ## Headline results (from the paper)
 - **Lorenz:** stable for about 10,000 Lyapunov times, and it reproduces the lobe-switching
@@ -203,86 +220,6 @@ and time is rescaled by `t_scale` so that J has unit variance.
 
   The edge value equals the nearest cell value plus or minus the integral of J over half a cell.
 
-## Window size (time subdivision)
-
-```python
-delta_t = dt * num_time_steps_per_data_sample / N    # window length
-N_t     = num_time_steps_per_data_sample // N + 1    # nodes per window
-h       = delta_t / (N_t - 1)                        # cell size
-```
-
-| Example | Window `delta_t` | Cells per window | Cell size h | Windows in training (`N`) | Unknowns per window |
-|---|---|---|---|---|---|
-| Lorenz | 0.1 (scaled to 0.745) | 10 | 0.01 | 11 | 3 × 23 = 69 |
-| Cylinder flow | 0.4 = 4 data steps (scaled to 0.409) | 4 | 0.1 | 8 | 64 × 11 = 704 |
-| Shear flow | 0.05 = 5 frames | 5 | 0.01 = 1 frame | 40 | 64 × 13 = 832 |
-
-"Scaled" means divided by the dataset's `t_scale` normalization; the cell sizes h are in
-physical (unscaled) time units.
-
-The window size is baked into `A` when the solver is built; to use a different one, rebuild the
-solver (no retraining needed, see below). `num_rollouts` changes only the number of windows. This
-is unrelated to the Swin `window_size=(8, 8)`, which is a spatial attention window.
-
-### Cells per window affect performance, not accuracy
-
-**With the cell size h fixed, the number of cells per window changes only speed and memory, not
-the solution.** Where two windows meet, the last J-row of one window plus the first J-row of the
-next add up to exactly the interior row of one long window:
-
-    window k, last row:     (h/6)J₄ + (h/3)J₅ + u₄ − λ₂ = 0
-    window k+1, first row:  (h/3)J₀′ + (h/6)J₁′ − u₀′ + λ₁′ = 0
-    with λ₁′ = λ₂, J₀′ = J₅: (h/6)J₄ + (2h/3)J₅ + (h/6)J₁′ + u₄ − u₀′ = 0   ← the interior row
-
-So chaining windows through λ solves the same global system as a single window over all cells, and
-because time-stepping is causal, solving window by window is exact.
-
-Checked numerically (shear flow, same network and start state, 200 cells):
-
-| Cells per window | max \|u − u(5 cells)\| | Relative gradient difference |
-|---|---|---|
-| 1 | 1.1e-14 | 3.3e-15 |
-| 10 | 8.9e-15 | 2.9e-15 |
-| 40 | 2.0e-14 | 3.8e-15 |
-
-| You change… | Cell size h | Effect |
-|---|---|---|
-| Cells per window (`N_t − 1`), keeping h | same | Performance only |
-| Window length, keeping cells per window | changes | Accuracy: h is the real time step; also changes the cell ↔ frame mapping (needs code changes and retraining) |
-
-In `03_shear_flow.py`, h = `dt` whatever `N` is, so **`N` is purely a performance knob** (it must
-divide 200). Caveats: Newton must converge to the same root (a very stiff trained model might
-converge more slowly or fail in long windows; that is speed or robustness, not accuracy), and
-round-off differences of about 1e-14 can grow over very long chaotic rollouts, like running on
-different hardware.
-
-**Measured cost** (shear flow, 200 cells, one MI210, untrained network, solver only):
-
-| Cells per window | Windows | Unknowns per window | Newton iterations | Rollout (s) | Training step (s) | Peak memory (GiB) |
-|---|---|---|---|---|---|---|
-| 1 | 200 | 320 | 3.0 | 14.4 | 18.4 | 6.6 |
-| 2 | 100 | 448 | 3.0 | 8.1 | 9.7 | 6.7 |
-| 5 (current) | 40 | 832 | 3.0 | 4.0 | 4.2 | 6.7 |
-| 10 | 20 | 1,472 | 3.0 | 2.3 | 2.5 | 7.1 |
-| 20 | 10 | 2,752 | 3.0 | 2.2 | 3.1 | 7.7 |
-| 40 | 5 | 5,312 | 3.4 | 2.5 | 2.7 | 9.4 |
-
-Small windows mean many sequential solves too small to keep the GPU busy; large windows mean
-fewer solves, but each dense solve costs n³ and memory grows as n².
-
-**How to choose:**
-1. Keep h equal to the data spacing (1 frame).
-2. Pick cells per window for speed: it must divide the training horizon (for 200 frames: 5, 8,
-   10, 20, 25, 40, …), the dense Jacobian (unknowns² × 8 bytes × batch) must fit in memory, and
-   Newton must still converge in a few iterations.
-3. Re-measure with the trained checkpoint: a stiffer trained network may need more Newton
-   iterations in long windows.
-4. A checkpoint trained with one window size can be rolled out with another: rebuild the solver
-   with the new `N`.
-
-For shear flow, `N = 20` (10 cells per window) looks best here: about 1.7× faster per training
-step, with the same results.
-
 ## Per-window system: H(p) = A·p + M·N_θ(p) − b = 0
 
 Per field, `p = [J_0…J_5, u_0…u_4, λ₁, λ₂]` (13 numbers). The 13 equations are:
@@ -294,7 +231,7 @@ Per field, `p = [J_0…J_5, u_0…u_4, λ₁, λ₂]` (13 numbers). The 13 equat
 | 1 | `J_0 − J_init = 0` | Initial velocity |
 | 1 | `λ₁ − u_init = 0` | Initial state |
 
-### Shapes (one window, batch size B, shear flow)
+### Shapes (one window, batch size B, shear flow, dense mode)
 
 | Symbol | Kind | Math shape | Code shape | Contents |
 |---|---|---|---|---|
@@ -407,7 +344,7 @@ with torch.no_grad():
             improved = RMS(H) < RMS(old_H)
             eta = 1 if improved else eta/2
             p   = p if improved else old_p
-        Δp = −solve(Jac, H)                   # 832×832 dense LU (_dense_solve)
+        Δp = −solve(Jac, H)                   # 832×832 dense LU (_dense_solve), or the block solve
         old_p = p
         p = p + eta·Δp
 Jac, H = _compute_J_and_residual(p)           # one more step WITH autograd:
@@ -416,12 +353,93 @@ p = p + eta · (−solve(Jac, H))                # attaches the implicit gradien
 
 - **Cost** is dominated by the network Jacobian: 64 backward passes through the transformer per cell.
   The 832×832 solve is cheap on a GPU.
-- **Measured iteration counts:** Lorenz (trained) 5–6, cylinder flow (trained) 6–7,
-  shear flow (untrained, random input) 3. The residual reaches about 1e-16 each time.
+- **Measured iteration counts:** Lorenz (trained) 5–6, cylinder flow (trained) 6–7, shear flow
+  (pretrained) 4–5 (3 with an untrained network). The residual reaches about 1e-16 each time.
 - **Quirks** (from reading the code, harmless in practice):
   1. A rejected step reuses Δp computed at the rejected point, applied at `old_p` with half the step size.
      This is not a textbook backtracking line search.
   2. The final step is scaled by eta, so the gradient is too if eta < 1 at convergence. Usually eta = 1.
+
+## Window size (time subdivision)
+
+```python
+delta_t = dt * num_time_steps_per_data_sample / N    # window length
+N_t     = num_time_steps_per_data_sample // N + 1    # nodes per window
+h       = delta_t / (N_t - 1)                        # cell size
+```
+
+| Example | Window `delta_t` | Cells per window | Cell size h | Windows in training (`N`) | Unknowns per window |
+|---|---|---|---|---|---|
+| Lorenz | 0.1 (scaled to 0.745) | 10 | 0.01 | 11 | 3 × 23 = 69 |
+| Cylinder flow | 0.4 = 4 data steps (scaled to 0.409) | 4 | 0.1 | 8 | 64 × 11 = 704 |
+| Shear flow | 0.05 = 5 frames | 5 | 0.01 = 1 frame | 40 | 64 × 13 = 832 |
+
+"Scaled" means divided by the dataset's `t_scale` normalization; the cell sizes h are in
+physical (unscaled) time units.
+
+The window size is baked into `A` when the solver is built; to use a different one, rebuild the
+solver (no retraining needed, see below). `num_rollouts` changes only the number of windows. This
+is unrelated to the Swin `window_size=(8, 8)`, which is a spatial attention window.
+
+### Cells per window affect performance, not accuracy
+
+**With the cell size h fixed, the number of cells per window changes only speed and memory, not
+the solution.** Where two windows meet, the last J-row of one window plus the first J-row of the
+next add up to exactly the interior row of one long window:
+
+    window k, last row:     (h/6)J₄ + (h/3)J₅ + u₄ − λ₂ = 0
+    window k+1, first row:  (h/3)J₀′ + (h/6)J₁′ − u₀′ + λ₁′ = 0
+    with λ₁′ = λ₂, J₀′ = J₅: (h/6)J₄ + (2h/3)J₅ + (h/6)J₁′ + u₄ − u₀′ = 0   ← the interior row
+
+So chaining windows through λ solves the same global system as a single window over all cells, and
+because time-stepping is causal, solving window by window is exact.
+
+Checked numerically (shear flow, same network and start state, 200 cells):
+
+| Cells per window | max \|u − u(5 cells)\| | Relative gradient difference |
+|---|---|---|
+| 1 | 1.1e-14 | 3.3e-15 |
+| 10 | 8.9e-15 | 2.9e-15 |
+| 40 | 2.0e-14 | 3.8e-15 |
+
+| You change… | Cell size h | Effect |
+|---|---|---|
+| Cells per window (`N_t − 1`), keeping h | same | Performance only |
+| Window length, keeping cells per window | changes | Accuracy: h is the real time step; also changes the cell ↔ frame mapping (needs code changes and retraining) |
+
+In `03_shear_flow.py`, h = `dt` whatever `N` is, so **`N` is purely a performance knob** (it must
+divide 200). Caveats: Newton must converge to the same root (a very stiff trained model might
+converge more slowly or fail in long windows; that is speed or robustness, not accuracy), and
+round-off differences of about 1e-14 can grow over very long chaotic rollouts, like running on
+different hardware.
+
+**Measured cost** (shear flow, 200 cells, one MI210, untrained network, solver only):
+
+| Cells per window | Windows | Unknowns per window | Newton iterations | Rollout (s) | Training step (s) | Peak memory (GiB) |
+|---|---|---|---|---|---|---|
+| 1 | 200 | 320 | 3.0 | 14.4 | 18.4 | 6.6 |
+| 2 | 100 | 448 | 3.0 | 8.1 | 9.7 | 6.7 |
+| 5 (current) | 40 | 832 | 3.0 | 4.0 | 4.2 | 6.7 |
+| 10 | 20 | 1,472 | 3.0 | 2.3 | 2.5 | 7.1 |
+| 20 | 10 | 2,752 | 3.0 | 2.2 | 3.1 | 7.7 |
+| 40 | 5 | 5,312 | 3.4 | 2.5 | 2.7 | 9.4 |
+
+Small windows mean many sequential solves too small to keep the GPU busy; large windows mean
+fewer solves, but each dense solve costs n³ and memory grows as n².
+
+**How to choose:**
+1. Keep h equal to the data spacing (1 frame).
+2. Pick cells per window for speed: it must divide the training horizon (for 200 frames: 5, 8,
+   10, 20, 25, 40, …), in dense mode the Jacobian (unknowns² × 8 bytes × batch) must fit in memory, and
+   Newton must still converge in a few iterations.
+3. Re-measure with the trained checkpoint: a stiffer trained network may need more Newton
+   iterations in long windows.
+4. A checkpoint trained with one window size can be rolled out with another: rebuild the solver
+   with the new `N`.
+
+For shear flow, `N = 20` (10 cells per window) looks best: 1.4–1.7× faster per training step
+(1.7× in this untrained sweep, 1.4× with the pretrained network; see "Linear solvers"), with the
+same results.
 
 ## N_θ: local cross-attention transformer (`CrossAttnTransformer.forward`)
 
@@ -523,9 +541,10 @@ meshes, point-cloud or Fourier autoencoder. The repo already shows two kinds: fi
 2. **F stays modest.** Per window with M cells: unknowns = F·(2M+3); the dense Jacobian costs
    (F·(2M+3))² memory and cubic solve time; the network Jacobian needs F backward passes per
    cell (the dominant cost); ∂N/∂u is F × F per cell. F = 64 is comfortable, a few hundred is
-   probably workable with smaller windows; F = 1024 (about 13,000 unknowns per window at M = 5)
-   would need the sparse solver (cuDSS) and a cheaper Jacobian strategy. This is estimated from
-   the scaling, not tested.
+   probably workable with smaller windows. Much larger F (e.g. 1024, about 13,000 unknowns per
+   window at M = 5) needs `linear_solver="block"` (the repo's cuDSS sparse path is NVIDIA-only;
+   see "Linear solvers on Frontier") and a cheaper way to compute the network Jacobian. This is
+   estimated from the scaling, not tested.
 3. **Differentiable, if trained jointly:** gradients flow from the decoder, through all windows,
    into the encoder.
 4. **Two starting frames** with known spacing, for `J_init = (L1 − L0)/dt` and
@@ -588,6 +607,7 @@ dataset gave an MSE of 1.86 instead of 4.6e-5.
   rollout on a random batch of 4 gives MSE 4.6e-5.
 - **Cylinder flow:** all 9 Reynolds numbers roll out 1000 windows. The largest final |u| is
   5.4–6.3, against 10.4 in the data.
+- **Shear flow:** see "Accuracy vs the paper" (224 held-out trajectories) and "Step timing" below.
 
 ## Platform note: AMD (ROCm) false "singular" linear solves
 
@@ -661,6 +681,136 @@ and its backward pass multiplied zero by the NaN solution. The counter is kept i
 - `_schur_complement_solve` (`backprop_type="schur"`) uses `torch.linalg.inv` through the same
   backend and is not covered. No example uses that mode.
 
+## Platform note: SOAP's QR on ROCm
+
+Training the shear-flow model **from scratch** on Frontier went NaN twice, at steps 714 and 731
+(jobs 5555394 and 5557663). Resuming from the pretrained checkpoint never showed it.
+
+### Symptom
+- From about step 150, the parameter check every 50 steps found the 8 ranks' weights differing by up
+  to 100% ("drifted (rel. 1.00e+00)"), although their gradients are identical after the all-reduce.
+- The NaN appeared right after a SOAP preconditioner update (every 10 steps), then spread to every
+  rank. Newton solves on rank 0 were fine up to that step. Every later solve failed, steps slowed
+  from 5 s to 100 s, and rank 0 wrote a 1.6 GB log.
+
+### Cause
+SOAP refreshes each preconditioner's eigenbasis with `torch.linalg.qr` (and sometimes
+`torch.linalg.eigh`) in float32 on the GPU. On ROCm, hipSOLVER's QR can return a Q that is far
+from orthogonal:
+
+| Input (from the saved SOAP state, step 400) | \|QᵀQ − I\| |
+|---|---|
+| GPU, float32 (as SOAP runs it) | **0.43**, the same on three repeats |
+| CPU, float32 | 7e-7 |
+| CPU, float64 | 1e-15 |
+
+- The matrix is 225×225 and rank-deficient, with entries up to 5.6e-14. 225 is the row count of
+  the Swin relative-position-bias tables (15×15), which get almost no gradient early in training.
+- Whether the GPU QR fails depends on the exact bits of the input: the same matrix computed on the
+  GPU instead of the CPU factors correctly. So the 8 ranks got different bases, which is the drift,
+  and a corrupt basis eventually blew the weights up.
+- The reference was trained on an NVIDIA H200, where this does not happen.
+
+### Fix: `SOAP._checked` in `soap.py`
+Every GPU QR and eigh result is checked (|QᵀQ − I| < 1e-3 and finite). If the check fails, it is
+recomputed on the CPU in float64 and the log gets one line:
+`SOAP: QR on cuda:0 not orthogonal (...); recomputed on CPU in float64 (total fallbacks: N)`.
+Nothing changes when the GPU result is fine.
+
+### Verification
+Job 5558706, from scratch, 2,600 steps:
+- About 250 fallbacks per rank, all on the same 225×225 matrix, nearly one per preconditioner
+  update.
+- No NaN and no skipped steps.
+- Rank drift stayed at round-off level, at most 9.4e-5 over 53 checks, where the failing runs
+  reached 1.0.
+- The loss followed the reference (next section).
+
+The same bug family as the false "singular" solves above: ROCm's dense factorizations can
+fail silently on inputs the CPU handles, so results that feed training should be checked.
+
+## Linear solvers on Frontier: dense, sparse and block
+
+### What exists
+| Candidate | Status on Frontier (torch 2.9.1 + ROCm 6.4) |
+|---|---|
+| Dense batched LU (`_dense_solve`) | The default; works, with the CPU fallback for the ROCm bug |
+| Repo's sparse path (`use_sparse_solver=True`, `sparse_solve` extension) | NVIDIA-only (cuDSS); the extension is not present, so it would crash at the first solve |
+| `torch.sparse.spsolve` | "not supported in ROCm build" |
+| CuPy sparse | Not installed |
+| SciPy `splu` (SuperLU, CPU) | Works, CPU only |
+| rocSOLVER / hipSOLVER / rocSPARSE, SuperLU_DIST modules | Present, but need a compiled extension |
+
+### The block solver (`linear_solver="block"`)
+After eliminating the known λ₁ = u_init and J₀ = J_init, each window's Jacobian is **block
+lower-triangular in time**: the equations of cell k involve only the unknowns of cells k, k−1 and
+k−2. Grouping unknowns as slabs (u_k, J_{k+1}) turns the Newton solve into a forward march: one
+2F × 2F dense solve per cell instead of one n × n solve. Its determinant is the product of the small
+blocks' determinants, so it is solvable exactly when the full system is; each block uses LU with
+pivoting, and errors propagate like an implicit time-stepper, as in the dense solve.
+
+`HybridNODESolver(..., linear_solver="block")` never builds `A`, `A_inv`, `exp_M_p0` or the dense
+Jacobian: it keeps the per-field block `A_per_field` (A = kron(I_F, A_per_field)) and the network's
+per-cell Jacobian blocks (`_BlockJacobian`). The starting guess uses the small per-field inverse.
+`apply_A(params)` gives A @ params in either mode. The default `"dense"` path is unchanged.
+
+### Results
+Standalone harness (`test_solver_backends.py`; real per-window Jacobians; one MI210; per solve call
+for a batch of 1–8 windows; results in `hnode_runs/solver_backends/`):
+
+| Case | Unknowns | Nonzeros | Dense GPU | SciPy CPU | Block GPU | Block vs dense |
+|---|---|---|---|---|---|---|
+| Cylinder matrix that trips the ROCm bug | 704 | 10.2% | NaN (bug) | exact | exact | — |
+| F = 64, M = 5 (shear flow) | 832 | 9.2% | 0.043 s | 0.11 s | 0.0085 s | 5.1× |
+| F = 64, M = 20 | 2,752 | 3.3% | 0.122 s | 0.37 s | 0.029 s | 4.3× |
+| F = 64, M = 40 | 5,312 | 1.8% | 0.144 s | 0.49 s | 0.058 s | 2.5× |
+| F = 128, M = 10 | 2,944 | 5.8% | 0.067 s | 0.42 s | 0.025 s | 2.7× |
+| F = 256, M = 10 | 5,888 | 5.7% | 0.164 s | 26 s | 0.068 s | 2.4× |
+
+All backends match a float64 reference to about 1e-15; the block pattern holds exactly; block vs
+dense gradients agree to about 1e-15 (for J on its nonzeros, and for the right-hand side). Run the
+harness one case per process: many cases in one process eventually trigger a hipBLAS failure.
+
+Solver option end to end (`test_block_mode.py`):
+- **Default mode is bit-identical** to the previous version (rollouts, gradients, Newton counts).
+- **Block vs dense:** rollouts agree to about 1e-17 and gradients to about 1e-15, with identical
+  Newton iteration counts (F = 64/M = 5 and 20, F = 128/M = 10).
+- **F = 256, M = 40 (21,248 unknowns per window):** the dense constructor fails (hipBLAS error on
+  `A_inv`); block mode solves a window in 0.6 s using 1.5 GiB.
+- **Shear-flow size (200 cells, batch 1):**
+
+| Cells per window | Mode | Rollout | Training step | Peak memory |
+|---|---|---|---|---|
+| 5 | dense | 3.74 s | 4.44 s | 6.88 GiB |
+| 5 | block | 4.01 s | 4.91 s | 6.57 GiB |
+| 10 | dense | 2.70 s | 3.09 s | 7.16 GiB |
+| 10 | block | 2.48 s | 2.99 s | 6.49 GiB |
+
+### Memory: where the solver matters
+The dense path's extra memory is its n × n matrices; at shear-flow size they are small:
+
+| Size | n | Fixed dense matrices (A, A_inv, exp_M_p0) | Per-window Jacobians kept for backprop | Dense-only total (est.) |
+|---|---|---|---|---|
+| F = 64, M = 5 | 832 | 17 MB | 40 × ~11 MB | ~0.4 GB (measured saving 0.31 GiB) |
+| F = 64, M = 10 | 1,472 | 52 MB | 20 × ~35 MB | ~0.7 GB (measured saving 0.67 GiB) |
+| F = 256, M = 10 | 5,888 | 0.8 GB | 20 × ~0.55 GB | ~12 GB |
+| F = 256, M = 40 | 21,248 | 10.8 GB | 5 × ~7.2 GB | ~47 GB (does not fit) |
+
+At F = 64 about 95% of the memory is the network Jacobian (`vmap(jacrev(N_θ))`, F backward passes
+per cell) and its double-backward graph, which the solver choice does not touch. To cut memory at
+this size, compute the Jacobian in chunks of cells, avoid keeping the whole double-backward graph,
+or run the autoencoder in float32.
+(The double-backward graph is now optional: `detach_final_jacobian`, which cuts training memory
+from 6.7 to 0.4 GiB per trajectory at F = 64 with the same gradient; see "Large latent dimensions".)
+
+### Recommendation
+- Keep `linear_solver="dense"` for shear flow and the gx project at their current sizes.
+- Use `"block"` for large latent dimensions or long windows, and as a workaround if the dense solve
+  keeps tripping the ROCm bug.
+- The bigger free speed-up for shear flow is **10 cells per window instead of 5** (`N = 20`):
+  1.4–1.6× faster training steps with the pretrained network in either mode (4.44 → 3.09 s dense,
+  4.91 → 2.99 s block), with identical results.
+
 ## Data-parallel training for shear flow (`03_shear_flow_ddp.py`)
 
 A separate script, `03_shear_flow_ddp.py`, trains the shear-flow model with one process per GPU.
@@ -710,11 +860,14 @@ to be small next to the Newton solves, and the script prints the time per step.
 | Same starting weights | Every rank loads the checkpoint (so SOAP's state matches too), then rank 0's parameters are broadcast |
 | Data | `DistributedSampler` (with `set_epoch`), so each rank takes the same number of steps; per-rank seeds give different random frames |
 | Global batch | `batch_size × world_size`; the learning rate is kept at 1e-4 |
-| Safety checks | Every step, ranks confirm they all-reduce the same set of gradients; every 50 steps, parameter checksums are compared and rank 0's weights re-broadcast if they drifted (e.g. SOAP eigendecomposition round-off) |
-| Rank 0 only | Logging, test loss, checkpoint saves and the evaluation figures (saved as `shear_flow_ddp_loss.png` and `shear_flow_ddp_rollout.png`) |
+| Safety checks | Every step, ranks confirm they all-reduce the same set of gradients; a step whose averaged gradient is not finite is skipped on every rank (the log names the ranks with a non-finite loss); every 50 steps, parameter checksums are compared and rank 0's weights re-broadcast if they drifted; checkpoints with non-finite weights are never saved, and the previous one is kept as `SAVE_PATH.prev` |
+| Rank 0 only | Logging, test loss, checkpoint saves and the evaluation figures (`shear_flow_ddp_loss.png`, `shear_flow_ddp_rollout.png`, `shear_flow_ddp_vrmse.png`) |
 | MIOpen cache | Per rank in `/tmp`, to avoid lock contention on a shared database |
 | Data source | `DATA_FORMAT=well` (default): The Well HDF5 files under `WELL_DATA_PATH`; `DATA_FORMAT=npy`: the local per-frame folders |
-| Test knobs | `CHECKPOINT_PATH` (`none` = from scratch), `SAVE_PATH`, `NUM_EPOCHS`, `MAX_STEPS`, `RUN_EVAL=0` |
+| Test knobs | `MODE` (`train`, `grad_check`, `eval`), `CHECKPOINT_PATH` (`none` = from scratch), `SAVE_PATH`, `NUM_EPOCHS`, `MAX_STEPS`, `RUN_EVAL=0` |
+| Long-run knobs | `TOTAL_STEPS` (stop once the loss history, carried by a resumed checkpoint, reaches it), `TIME_LIMIT` (save and stop cleanly after this many seconds), `TEST_EVERY` (rank-0 test loss interval, default 25), `SOLVER_VERBOSE=0` (drop the per-solve "Converged after ..." lines); a resumed run continues the epoch count |
+| Batch and learning rate | `BATCH_PER_RANK` (trajectories per GPU, default 1), `LR` (SOAP learning rate, default 1e-4; logged at start-up). A resumed run keeps the learning rate stored in its checkpoint's optimizer state, whatever `LR` says |
+| Multi-node (`run_shear_flow_repro.sh`) | `sbatch -N <nodes>`, `RANKS_PER_NODE` (default 8), `RCCL_PLUGIN_DIR` (aws-ofi-rccl for RCCL over Slingshot; with more than one node the script also sets `NCCL_SOCKET_IFNAME=hsn0`) |
 
 ### Running
 ```bash
@@ -724,14 +877,27 @@ MAX_STEPS=5 RUN_EVAL=0 sbatch run_shear_flow_ddp.sh   # short smoke test
 Or, inside an allocation:
 `srun -N1 -n8 -c7 --gpus-per-task=1 --gpu-bind=closest python -u 03_shear_flow_ddp.py`
 
+Check modes (same script, same model and checkpoint setup; training is skipped):
+```bash
+MODE=grad_check sbatch run_shear_flow_ddp.sh     # 8-GPU averaged gradient vs 1-GPU batch-8 gradient
+MODE=eval EVAL_OUT=<dir> DUP_MAP=<dup_map.json> sbatch run_shear_flow_ddp.sh   # held-out evaluation
+```
+`MODE=eval` rolls out all 200 frames of every valid and test trajectory (`EVAL_SPLITS`), computes
+per-frame VRMSE, and writes `vrmse.npz`, `summary.txt` and `vrmse_vs_horizon.png`.
+
+**Launcher fix.** `sbatch` copies the submitting shell's environment. When the conda env was
+already active there, `module load python` put the base interpreter first on `PATH` and
+`conda activate` did nothing, so `python` had no torch. `run_shear_flow_ddp.sh` now runs
+`$CONDA_PREFIX/bin/python` explicitly and checks that torch imports before launching.
+
 ### Data: The Well HDF5 files, read directly
 
 **Location:** `/lustre/orion/world-shared/fus184/jyc/the_well/datasets/shear_flow/`, downloaded with
-`the-well-download --base-path <dir> --dataset shear_flow --split train` (and `--split test`).
+`the-well-download --base-path <dir> --dataset shear_flow --split train` (and `--split valid`, `--split test`).
 
 | | |
 |---|---|
-| Files | One HDF5 file per (Re, Sc) pair and split: 28 in `data/train` (32 trajectories each, 896 total) and 28 in `data/test` (4 each, 112 total); about 16.8 GB per train file. No `valid` split was downloaded (not used) |
+| Files | One HDF5 file per (Re, Sc) pair and split: 28 in `data/train` (32 trajectories each, 896 total), 28 in `data/valid` and 28 in `data/test` (4 each, 112 total per split); about 16.8 GB per train file, 58.7 GB per held-out split |
 | Per trajectory | 200 frames on a 256 × 512 grid (x × y), periodic in both directions |
 | Fields | `t0_fields/tracer`, `t0_fields/pressure` (trajectories, 200, 256, 512) and `t1_fields/velocity` (…, 2), float32; uncompressed and stored contiguously |
 | Scalars | `scalars/Reynolds`, `scalars/Schmidt` (float32) |
@@ -770,6 +936,13 @@ training. It returns the same batch as `SubsamplingDataset`, and both classes ha
 - Scalars are kept as float32 (Sc = 0.10000000149…), like the local `scalars.npy`; converting to an
   exact 0.1 would slightly change the conditioning input the checkpoint was trained with.
 
+**Train / held-out overlap (important for any accuracy number):** 88 of 112 valid and 89 of 112
+test trajectories are byte-identical copies of training trajectories (matched by hashing tracer
+frames 10 and 150; 6 spot-checked over all 200 frames and all fields). Only 47 of the 224 held-out
+trajectories are unseen. For example, train trajectory 0 equals test trajectory 0 (the local
+`traj_0` in both folders). The map is in `hnode_runs/eval_full/dup_map.json` (built by
+`hnode_runs/eval_full/make_dup_map.py`). The cause is unknown; these are the raw downloaded files.
+
 **Verification:** with the same seed, `WellShearFlowDataset` and `SubsamplingDataset` return
 identical samples (all four fields, dtype and values) for train and test, and identical full
 200-frame trajectories. The loader delivers about 0.22 s per sample with 4 workers, after a 25 s
@@ -781,8 +954,442 @@ startup.
 |---|---|---|
 | 2026-09-23 | Login node, 1 MI210, 1 rank NCCL, local `.npy` data | Init, broadcast, a full training step (40 windows, 3 Newton iterations each, residual about 1e-16), all-reduce and `optimizer.step()` ran; stopped in the test evaluation because only `test/traj_0` exists locally |
 | 2026-09-24 | Login node, 1 MI210, 1 rank NCCL, The Well data, from scratch, 2 steps | **Complete:** 896/112 trajectories; step 0 took 88 s (compilation plus the first test evaluation), step 1 took 4.7 s; parameter sync check, checkpoint save (5.1 GB) and both evaluation figures all worked |
-| 2026-09-24 | Compute node, 8 GPUs (job 5539007, 5 steps, from the pretrained checkpoint) | Submitted; pending |
+| 2026-09-24 | Compute node, 8 GPUs, job 5539007 | Failed after 7 s: `python` was the base interpreter (no torch). Fixed in `run_shear_flow_ddp.sh` (see "Running") |
+| 2026-09-24 | 8 GPUs, job 5540785, 5 steps from the pretrained checkpoint | **Passed:** 8 ranks over RCCL; loss 2.7–4.3e-3 (checkpoint's recent median 2.5e-3); parameters in sync; checkpoint saved |
+| 2026-09-24 | 8 GPUs, job 5540926, 30 steps with a per-step timing breakdown | **Passed;** timing below |
+| 2026-09-24 | 8 GPUs, job 5543764, `MODE=grad_check` | **Passed:** per-sample losses equal to 3e-17; averaged gradient vs single-GPU batch-8 gradient relative difference **1.25e-14** |
+| 2026-09-24 | 8 GPUs, job 5543765, `MODE=eval` (224 held-out trajectories) | **Completed in 6 min;** results in "Accuracy vs the paper" below |
+| 2026-09-27 | 8 GPUs, job 5555394, from scratch (24-h extended job) | **Failed:** NaN at step 714; cancelled after 13.9 h (see "Platform note: SOAP's QR on ROCm") |
+| 2026-09-28 | 8 GPUs, job 5557663, from scratch, with the non-finite-gradient guard | **Failed:** NaN at step 731 despite the guard, because the NaN came from SOAP's update, not the gradient |
+| 2026-09-28 | 8 GPUs, job 5558706, from scratch, with the SOAP fix | **Passed:** 2,600 steps in 3 h 41 min, loss matching the reference (below); stopped on purpose |
+| 2026-09-28 | 8 GPUs, job 5560440, 1/2/4/8 trajectories per GPU, 13 steps each | 1 and 2 **passed** (19.1 and 33.3 GiB); 4 failed on the first backward ("HIP error: no kernel image is available"); 8 out of memory |
+| 2026-09-28 | 2 nodes, job 5563103, 552 MB float64 all-reduce | Sockets 435 ms; **aws-ofi-rccl 33 ms** |
+| 2026-09-28 | 8 GPUs, job 5560751, batch 16 (2 per GPU), lr 1.4e-4, from scratch | **Passed:** 2,248 steps in 3 h 52 min (below) |
+| 2026-09-29 | 4 nodes × 8 GCDs, job 5564781, batch 64 (2 per GPU), lr 2.83e-4, from scratch | **Passed:** 922 steps in 1 h 52 min; first multi-node run (below) |
+| 2026-09-29 | 2 nodes × 8 GCDs, job 5565107, batch 32 (2 per GPU), lr 2e-4, from scratch | **Passed:** 920 steps in 1 h 58 min (below) |
 
 RCCL refuses two ranks on one GPU ("Duplicate GPU detected"), so multi-rank NCCL can only be
 tested on a compute node. With 8 ranks an epoch is 112 steps per rank, so 10 epochs is about
 1,120 steps.
+
+### Step timing (8 GPUs, batch 8, job 5540926)
+
+| Part | Typical step |
+|---|---|
+| Data wait | 0.00 s (the loader keeps up) |
+| Forward (encoder, 40 Newton-solved windows, decoder) | 3.85 s |
+| Backward | 0.82 s |
+| Gradient all-reduce | 0.02 s (slowest rank about 0.1 s) |
+| Optimizer | 0.20 s |
+| **Total** | **about 4.9 s** |
+
+Occasional slow steps:
+- **One-time recompilation** of the Swin encoder on step 2 (about 70 s): `torch.compile` guards on
+  an attention-mask cache that fills on the first call.
+- **Every 10th step, +6–7 s:** SOAP's preconditioner update (`precondition_frequency=10`), about
+  12% on average.
+- **Every 25th step, +44 s on rank 0:** the test evaluation, while the other 7 ranks wait (seen as a
+  44 s all-reduce on the next step). Up to about 35% overhead if it stays that slow; worth fixing
+  by spreading it over ranks or running it less often.
+
+One epoch (896 trajectories, 112 steps) takes roughly 11–14 minutes. The paper trained for 8 days on
+one H200 with batch 8 (Table 1), about 4.8 s per step over ~144,000 steps; one Frontier node runs
+at about the same speed, so full training from scratch would take roughly 8–9 days on one node.
+More nodes would raise the global batch above the paper's 8.
+
+### Training from scratch vs the reference checkpoint
+
+We trained `03_shear_flow_ddp.py` from scratch with the notebook's settings (batch 8 = 1 trajectory
+per GPU × 8 GPUs, SOAP lr 1e-4, 40 windows × 5 cells) using `run_shear_flow_repro.sh`, and **stopped
+at step 2,600** (job 5558706, 3 h 41 min, about 5.1 s per step). The full 144,000 steps would take
+about 8.4 days of compute on one node (about nine 24-hour jobs), against the paper's 8 days on one
+H200, so we compared the loss curve instead of training to the end.
+
+**The training loss matches the reference checkpoint's history over those 2,600 steps**
+(200-step means of the training loss, VRMSE²):
+
+| Step | 500 | 1,000 | 1,500 | 2,000 | 2,500 |
+|---|---|---|---|---|---|
+| Ours | 0.458 | 0.131 | 0.087 | 0.069 | 0.057 |
+| Reference (`shear_flow_redo_part_2.pt`) | 0.439 | 0.142 | 0.096 | 0.073 | 0.061 |
+
+- The two curves overlap from the first steps; ours is 4–10% lower from step 1,000 on, within the
+  noise of different random draws of trajectories and frames.
+- The test loss is too noisy to compare this way: each value is one test trajectory with 12
+  frames, and ours is computed every 250 steps (`TEST_EVERY`) against the reference's every 25.
+- This shows our setup (ROCm, 8-GPU data parallelism, The Well HDF5 input, the SOAP fix) trains the
+  model the same way as the original; it does not show the final accuracy, which needs the full run.
+
+Outputs in `hnode_runs/repro/`: `checkpoint.pt` (step 2,600), `repro_vs_reference.png` (training
+loss curves), `repro_vs_reference.npz`, and the first lines of the two failed runs' logs.
+
+### Larger batches: faster per hour, less efficient per sample
+
+The reference trains at batch 8 on one H200. On Frontier, batch 8 is 1 trajectory on each of a
+node's 8 GCDs, and a step is latency-bound (40 Newton-solved windows, one after another), so we
+tried more trajectories per GPU.
+
+**Memory limits it to 2 per GPU** (job 5560440, from the step-2,600 checkpoint):
+
+| Trajectories per GPU | Typical step | Samples/s (8 GPUs) | Peak memory (of 64 GiB) |
+|---|---|---|---|
+| 1 | 4.1 s | 1.6 | 19.1 GiB |
+| 2 | 5.0 s | 2.8 | 33.3 GiB |
+| 4 | failed on the first backward ("HIP error: no kernel image is available"), at about 61 GiB estimated | | |
+| 8 | out of memory (about 117 GiB needed) | | |
+
+- Each trajectory costs about 14 GiB (12 decoded 256×512 frames and the Newton Jacobians, float64),
+  plus about 5 GiB fixed.
+- **Why the paper fits batch 8 on one GPU:** an H200 has 141 GB, and 5 + 8 × 14 ≈ 117 GiB fits. A
+  Frontier GCD has 64 GB. An MI250X card has 128 GB, but as two separate 64 GB devices.
+- Batching is nearly free for the solver: doubling the trajectories per GPU adds about 0.9 s per step.
+
+**Across nodes**, RCCL needs the aws-ofi-rccl plugin. A 552 MB float64 all-reduce (the gradient
+size) over 2 nodes took 435 ms over sockets and 33 ms with the plugin (job 5563103). The build under
+`csc143/.../aws-ofi-rccl/rocm6.3.1` has only dangling symlinks; we used
+`/sw/frontier/mde/lrn068_mde/phil836/aws-ofi-rccl/lib`, which links against ROCm 6.3.1 and libfabric
+2.3.1. In training, the cross-node all-reduce took a median 0.05 s of a 6.9 s step on 2 nodes and
+0.04 s on 4 nodes, with occasional slow steps (90th percentile 0.4 s and 0.7 s).
+
+**Convergence** (from scratch, learning rate scaled as 1e-4 × √(batch/8), training loss VRMSE²):
+
+| Trajectories seen | Batch 64, lr 2.83e-4 (4 nodes) | Batch 32, lr 2e-4 (2 nodes) | Batch 16, lr 1.4e-4 (1 node) | Batch 8 (1 node) | Reference |
+|---|---|---|---|---|---|
+| 9,600 | 0.887 | 0.850 | 0.236 | 0.107 | 0.117 |
+| 16,000 | 0.877 | 0.247 | 0.101 | 0.069 | 0.073 |
+| 20,800 | 0.559 | 0.128 | 0.077 | 0.056 | 0.058 |
+| 29,000 | 0.220 | 0.076 | 0.058 | — | 0.043 |
+| 59,000 | 0.056 | — | — | — | 0.021 |
+
+| Hours of training | Batch 64 (4 nodes) | Batch 32 (2 nodes) | Batch 16 (1 node) | Batch 8 (1 node) |
+|---|---|---|---|---|
+| 1.0 | **0.156** | 0.282 | 0.265 | 0.209 |
+| 1.5 | **0.070** | 0.100 | 0.121 | 0.123 |
+| 1.8 | **0.057** | 0.076 | 0.093 | 0.099 |
+
+To reach loss 0.08 (smoothed training loss):
+
+| | Batch 64 (4 nodes) | Batch 32 (2 nodes) | Batch 16 (1 node) | Batch 8 (1 node) |
+|---|---|---|---|---|
+| Hours | **1.38** | 1.75 | 2.08 | 2.37 |
+| Speed-up over batch 8 | **1.72×** | 1.35× | 1.14× | 1× |
+| Node-hours | 5.5 | 3.5 | **2.1** | 2.4 |
+
+- **Per trajectory seen, bigger batches need more data:** at 29,000 trajectories batch 16 is at
+  1.3× the reference's loss and batch 32 at 1.8×; batch 64 is at 2.6× by 59,000. The bigger the
+  batch, the longer the early plateau near 0.9: to about 8,000 trajectories at batch 32 and 18,000
+  at batch 64.
+- **Per hour, bigger batches win, and the gap grows with time:** batch 64's speed-up over batch 8
+  is 1.4× to reach 0.10, 1.7× to reach 0.08 and about 2× to reach 0.057 (1.8 h against about 3.7 h).
+- **Per node-hour, batch 16 on one node is the cheapest;** batch 32 and 64 cost about 1.5× and 2.3×
+  the node-hours of batch 8 for their speed.
+- **Step times:** 5.1 s (batch 8), 6.0 s (16), 6.9 s (32 and 64). With all 8 GCDs of a node in use,
+  steps are about 10% slower than with 2 per node (an earlier batch-32 test on 8 nodes × 2 GCDs ran
+  6.3 s steps, at 4× the node-hours). At batch 64 an epoch is only 14 steps, and each epoch's first
+  step waits about 4 s for the data loaders.
+- **Only the first 2–4 hours are measured.** The gains could change later in training, and a larger
+  batch is a different training run: whether it ends as accurate as the reference is unknown.
+
+Rough cost of a full 144,000-step reproduction, scaling batch 8's 8.2 days by the speed-ups above
+(the lower speed-up measured to 0.08, the higher at the end of each run where known):
+
+| Setup | Wall-clock | Node-hours | Same training as the reference |
+|---|---|---|---|
+| Batch 8, 1 node | about 8.2 days | about 196 | Yes |
+| Batch 16, 1 node | about 6.3–7.2 days | about 150–175 | No |
+| Batch 32, 2 nodes | about 6 days | about 290 | No |
+| Batch 64, 4 nodes | about 4.1–4.8 days | about 390–460 | No |
+
+Outputs: `hnode_runs/batch_timing/` (memory and timing logs), `hnode_runs/multinode/` (all-reduce
+benchmark), `hnode_runs/repro_b16/`, `hnode_runs/repro_b32_2n/` and `hnode_runs/repro_b64/`
+(checkpoints, logs, `b16_vs_b8.png`; `repro_b64/batch_comparison.png` has all four batch sizes).
+
+## Accuracy vs the paper (held-out evaluation)
+
+`MODE=eval` with the pretrained checkpoint (`shear_flow_redo_part_2.pt`): full 200-frame rollouts
+from frames 0–1 on all 224 valid + test trajectories. VRMSE as The Well defines it: per field,
+√(mean squared error / (spatial variance + 1e-7)) in physical units, averaged over the 4 fields,
+then over trajectories.
+
+| Horizon | 1 | 10 | 25 | 50 | 75 | 100 | 150 | 199 | Mean |
+|---|---|---|---|---|---|---|---|---|---|
+| **All 224 held-out** | 0.032 | 0.031 | 0.035 | 0.047 | 0.048 | 0.045 | 0.043 | 0.044 | **0.042** |
+| 47 unique (not in train) | 0.031 | 0.031 | 0.034 | 0.041 | 0.042 | 0.041 | 0.042 | 0.045 | 0.040 |
+| 177 duplicates of train | 0.032 | 0.031 | 0.036 | 0.049 | 0.049 | 0.046 | 0.043 | 0.044 | 0.043 |
+| Re = 1e4 (56) | 0.034 | 0.034 | 0.035 | 0.042 | 0.042 | 0.038 | 0.034 | 0.037 | 0.037 |
+| Re = 5e4 (56) | 0.031 | 0.029 | 0.034 | 0.042 | 0.041 | 0.040 | 0.036 | 0.039 | 0.037 |
+| Re = 1e5 (56) | 0.031 | 0.031 | 0.034 | 0.046 | 0.045 | 0.044 | 0.041 | 0.040 | 0.041 |
+| Re = 5e5 (56) | 0.032 | 0.031 | 0.039 | 0.058 | 0.061 | 0.059 | 0.059 | 0.059 | 0.055 |
+| **Paper Fig. 4c HNODE** (read off the plot) | ~0.03 | ~0.03 | ~0.045 | ~0.08 | ~0.10 | ~0.105 | ~0.125 | ~0.13 | — |
+
+- **Short horizons match the paper** (~0.03). **At long horizons ours is 2–3× lower** than the
+  paper's plotted curve, and levels off around 0.045 instead of rising to 0.13.
+- **The overlap does not flatter the model:** the 47 unseen trajectories score slightly better
+  (0.040) than the 177 duplicates (0.043).
+- **Stable:** no blow-up over 200 frames for any group; higher Re is harder, as expected.
+- **Why lower than the paper is unknown**, since the paper does not give its exact procedure:
+  VRMSE computed or averaged differently (per field vs pooled, before or after the square root, a
+  different ε, which matters late when the tracer fades), a different checkpoint, or a different
+  horizon definition. With the training loss's definition (normalized units, ε = 1e-3) the mean is
+  even lower, 0.031.
+- The paper's baselines on the same plot: PhysiX ~0.25–0.5, C-U-Net up to about 40.
+
+Outputs: `hnode_runs/eval_full/pretrained/` (`vrmse.npz` holds per-trajectory, per-frame, per-field
+errors with split, Re, Sc and duplicate flags). The notebook's rollout figure for test trajectory 0
+is reproduced exactly by the script's evaluation section (`hnode_runs/eval_traj0/`).
+
+## Large latent dimensions (F = 512 and 1024)
+
+The paper's models use F = 64. This section is about running HNODE with latent dimension 512 or 1024,
+tested on shear-flow POD coefficients (`latent_baselines.py hnode` with `R=512` or `R=1024`).
+
+### Where the cost goes
+- **The network Jacobian is per cell, not per window.** `CrossAttnTransformer.forward` computes
+  each cell's Jacobian with `vmap(jacrev)`: F backward passes giving an F × F block (u) and an
+  F × 2F block (J tokens). The width stays 256, so the inputs enter through Linear(F → 256) and
+  the output leaves through Linear(256 → F); each per-cell Jacobian therefore has rank ≤ 256.
+- **The training memory was the final Newton step's graph.** The implicit-function gradient comes
+  from one final Newton step with autograd on, `params − J⁻¹H`. Its gradient is
+  `−J⁻¹ ∂H/∂θ − d(J⁻¹)·H`. The second term is multiplied by H, which is below 1e-12 at
+  convergence, yet keeping it stored a backward pass through `jacrev` for every window. Detaching
+  J drops that graph and leaves the gradient unchanged (relative difference 1.3e-16 at F = 64,
+  5.4e-15 at F = 256).
+- **At large F the linear solves dominate the time**: 18.6 s of a 23 s rollout at F = 1024 with
+  the block solver. The network and its Jacobian take 4.5 s.
+
+### Options added
+The solver and network options are opt-in, so their defaults (and the gx project) are unchanged.
+`latent_baselines.py` turns detach and the relative tolerance on by default; for converged windows
+this changes results only at rounding level (about 1e-15).
+
+| Where | Option | What it does |
+|---|---|---|
+| `hybrid_node_solver.py` | `solver.detach_final_jacobian = True` | Detaches J (dense tensor or `_BlockJacobian.detached()`) in the final Newton step. Same gradient, far less memory |
+| `hybrid_node_solver.py` | `solver.relative_tol = True` | Converged when `max|H| < tol · max(1, max|params|)`. The residual's rounding floor grows with the state, so states of ~1e4 never reach an absolute 1e-12, and each such window ran all `max_iters` iterations |
+| `neural_networks.py` | `net.jacobian_chunk_size = N` | Passes `chunk_size=N` to both `jacrev` calls. Not useful after the detach: no memory saved, up to 2× slower |
+| `latent_baselines.py` | `HNODE_SOLVER` (`dense`/`block`) | Linear solver; use `block` at large F |
+| `latent_baselines.py` | `HNODE_DETACH` (default `1`) | Sets `detach_final_jacobian` |
+| `latent_baselines.py` | `HNODE_RELTOL` (default `1`) | Sets `relative_tol` |
+| `latent_baselines.py` | `HNODE_MAX_ITERS` (solver default 100) | Newton iteration cap; 30 for the large-F runs |
+| `latent_baselines.py` | `MICRO` (default 0 = whole local batch) | Trajectories per forward pass on a GPU; gradients are accumulated, so the global batch and the gradient are unchanged |
+
+The step log of `latent_baselines.py` now also prints peak GPU memory.
+
+### Profile: one MI250X GCD, batch 1, 40 windows × 5 cells
+`run_profile_latent_dim.sh` (job 5629560) runs `profile_latent_dim.py` on POD coefficients of real
+shear-flow frames with a randomly initialized N_θ (width 256, 3 blocks, 4 heads) and dt = 0.01.
+Newton needed 3–4 iterations per window at every F. Training step, time / peak memory:
+
+| F | Unknowns per window | Dense (default) | Block | Block + detach |
+|---|---|---|---|---|
+| 64 | 832 | 3.4 s / 6.7 GiB | 3.9 s / 6.4 GiB | **3.3 s / 0.4 GiB** |
+| 128 | 1,664 | 4.9 s / 14.2 GiB | 4.7 s / 12.6 GiB | **4.5 s / 0.8 GiB** |
+| 256 | 3,328 | 8.7 s / 31.3 GiB | 6.7 s / 25.7 GiB | **5.9 s / 2.2 GiB** |
+| 512 | 6,656 | out of memory | 11.9 s / 55 GiB | **10.6 s / 6.6 GiB** |
+| 1024 | 13,312 | out of memory | out of memory | **23.8 s / 23.3 GiB** |
+
+Rollout without gradients at F = 1024: 96 s dense, 23 s block. Adding `chunk64` to block + detach
+made steps up to 2× slower with the same memory. After the detach, memory grows roughly as F², so
+F = 2048 (about 90 GiB per trajectory) needs more: a low-rank (≤ 256) Jacobian or splitting a
+trajectory across GPUs. Results: `hnode_runs/latent_dim_profile/sweep/` (`summary.txt`,
+`latent_dim_profile.png`).
+
+### Two things that went wrong in the first tests
+1. **Newton stalls on blown-up rollouts.** A 10-step test (`STEPS=10`) reaches the 199-frame
+   horizon at step 6 with an almost untrained model. Its rollouts grow from |state| ≈ 16 to
+   ≈ 1e5 over 40 windows. Newton then fails in two ways: genuinely, with |H| from 0.1 to 25; and at
+   the rounding floor, at about 1e-11 against the absolute 1e-12. Every stalled window ran 100
+   iterations; 715 of them in 28 minutes. On the first 8 windows from real frames, Newton converges
+   in 3–4 iterations to 1e-14 at R = 512, dense and block alike
+   (`hnode_runs/latent_dim_profile/newton_diag/`). Fixes: `HNODE_RELTOL=1`, `HNODE_MAX_ITERS=30`.
+   In a real run, the 199-frame horizon starts at step 1,501, after training on horizons 10 and 50.
+2. **R = 1024 with 2 trajectories per GCD runs out of memory** at the first 199-frame step:
+   45.7 GiB allocated plus 17.3 GiB reserved but fragmented. `expandable_segments` is "not
+   supported on this platform" (PyTorch ROCm). `MICRO=1` (one trajectory per forward pass,
+   accumulated) brings the peak to 25.3 GiB.
+
+Test runs, global batch 16 on 8 GCDs, 2 trajectories per GCD:
+
+| R | Job | Settings | Peak memory (h = 10 / 50 / 199) | s/step at h = 199 (untrained, blown up) |
+|---|---|---|---|---|
+| 512 | 5630651 | block, detach, reltol, 30 iterations | 4.2 / 6.3 / 14.0 GiB | 6–15 |
+| 1024 | 5630675 | same | 9.3 / 17.4 GiB / out of memory | — |
+| 1024 | 5630684 | same + `MICRO=1` | 6.0 / 10.0 / 25.3 GiB | 14–31 |
+
+### How to run
+From the repo directory, one row = HNODE (8 GCDs, chained 2-hour jobs) + the other time steppers
++ the evaluation with the POD decoder:
+
+```bash
+# F = 512: 2 trajectories per GCD fit (14 GiB)
+HNODE_SOLVER=block HNODE_MAX_ITERS=30 HNODE_CHAIN=6 \
+    ./submit_latent_row.sh ../hnode_runs/pod/full 512 ../hnode_runs/rows/pod512 pod:512
+
+# F = 1024: one trajectory per forward pass (25 GiB); same global batch 16
+HNODE_SOLVER=block HNODE_MAX_ITERS=30 MICRO=1 HNODE_CHAIN=8 \
+    ./submit_latent_row.sh ../hnode_runs/pod/full 1024 ../hnode_runs/rows/pod1024 pod:1024
+```
+
+`HNODE_DETACH=1` and `HNODE_RELTOL=1` are already the defaults. A short test first:
+`sbatch -t 01:00:00 --export=ALL,JOB=hnode,LATENT_DIR=…/pod/full,R=1024,OUT=…,HNODE_SOLVER=block,HNODE_MAX_ITERS=30,MICRO=1,STEPS=10,CKPT_EVERY=5 run_latent_job.sh`.
+Delete the test's `OUT/hnode/` before rerunning, or it resumes from its checkpoint.
+
+The stored POD basis has 1,024 modes, so R ≤ 1024 without recomputing it. Profiling:
+`sbatch run_profile_latent_dim.sh` (all cases), or
+`python profile_latent_dim.py F block+detach OUT.json` for one case.
+
+In other code (e.g. a large-F model elsewhere):
+
+```python
+solver = HybridNODESolver(net, ..., linear_solver="block")
+solver.detach_final_jacobian = True   # same gradient, far less memory
+solver.relative_tol = True            # tolerance scaled by the state size
+solver.max_iters = 30
+```
+
+### What to expect
+- **The POD floor limits accuracy, not HNODE**: projection VRMSE 0.178 at R = 512 and 0.122 at
+  R = 1024, vs 0.278 at R = 128. The Swin-autoencoder row is already at 0.12 (LSTM 0.119,
+  HNODE 9k 0.121) with 64 dimensions. These rows test whether HNODE trains and scales at large F.
+- **Cost of the finished runs** (3,000 steps, 8 GCDs): the R = 1024 `floor:64` run took 11.1 hours
+  of training (40,029 s). The results are in the next section.
+- **Possible use for the full Swin-HNODE:** `detach_final_jacobian` should also cut the end-to-end
+  training memory (about 14 GiB per trajectory now, which limits the batch per GCD). Untested.
+
+## Does a larger latent dimension help HNODE?
+
+**Short answer: no, not as trained here.** Going from 64 to 1,024 POD or Fourier POD coefficients
+does not make HNODE more accurate, and there is no consistent trend with r. Above r ≈ 256 the
+small scales get worse. A better 64-dimensional latent space (Swin) helps much more than more
+POD modes.
+
+### Setup
+- **Latent spaces:** POD and Fourier POD of shear flow (`pod_basis.py`, 1,024 modes each), at
+  r = 64, 128, 256, 512 and 1024. One "row" per basis and r (`hnode_runs/rows/{pod,fpod}R/`).
+- **Time steppers on the frozen latents** (`latent_baselines.py`): HNODE with SOAP at lr 1e-4 and
+  HNODE_DT = 1, plus LSTM, NODE, Koopman and DMD at their best learning rate (`best.json`). All get
+  3,000 steps at global batch 16, horizons 10 → 50 → 199, and a latent-space MSE loss.
+- **HNODE coefficient scalings (`SCALE`):** `mode` (every coordinate to unit std), `shared` (one
+  factor, the largest std) and `floor:64` (unit std for the 64 largest coordinates, the 64th std
+  for the rest). `floor:64` is the main series; it equals `mode` at r = 64.
+- **For comparison, 64-dimensional Swin latents:** the two-stage Swin autoencoder
+  (`ae_train.py`, `hnode_runs/ae/swin64/row/`) with the same time steppers, and the pretrained
+  end-to-end Swin-HNODE checkpoint (144,001 steps at batch 8 with a pixel loss).
+- **Evaluation:** `eval_latent_rollout.py`, VRMSE as in "Accuracy vs the paper", over frames
+  1–199 and the 224 held-out trajectories. Tables: `summarize_latent_dim.py`.
+
+### VRMSE versus r
+
+Mean VRMSE (lower is better; "projection" is the basis's own coefficients, the best a time
+stepper can do in that space):
+
+| | r = 64 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|
+| POD projection | 0.371 | 0.278 | 0.233 | 0.178 | 0.122 |
+| POD HNODE `floor:64` | 4.22 | 4.17 | 4.39 | 7.16 | 3.51 |
+| POD HNODE `shared` | 7.83 | 7.34 | 6.61 | 3.45 | 6.32 |
+| POD LSTM | 1.15 | 1.29 | 1.13 | 1.20 | 1.50 |
+| Fourier POD projection | 0.330 | 0.284 | 0.212 | 0.172 | 0.118 |
+| Fourier POD HNODE `floor:64` | 4.08 | 4.51 | 4.73 | 7.80 | 3.42 |
+| Fourier POD HNODE `shared` | 8.44 | 8.19 | 6.94 | 6.31 | 9.29 |
+| Fourier POD LSTM | 1.19 | 1.01 | 1.40 | 1.20 | 1.63 |
+
+Median over trajectories (less affected by the pressure and v_y frames whose variance is near
+zero):
+
+| | r = 64 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|
+| POD projection | 0.156 | 0.121 | 0.095 | 0.070 | 0.049 |
+| POD HNODE `floor:64` | 0.482 | 0.499 | 0.521 | 0.637 | 0.677 |
+| POD LSTM | 0.237 | 0.238 | 0.240 | 0.235 | 0.248 |
+| Fourier POD HNODE `floor:64` | 0.491 | 0.508 | 0.537 | 0.623 | 0.633 |
+
+64-dimensional Swin latents:
+
+| Model | Mean | Median |
+|---|---|---|
+| Swin autoencoder projection | 0.090 | 0.072 |
+| Swin autoencoder + HNODE, 3,000 steps | 0.219 | 0.213 |
+| Swin autoencoder + HNODE, 9,000 steps | 0.121 | 0.105 |
+| Swin autoencoder + LSTM | 0.119 | 0.106 |
+| Pretrained Swin-HNODE (end to end) | 0.042 | 0.035 |
+
+- **The projection improves steadily with r** (0.37 → 0.12), so the extra modes carry
+  information. **HNODE does not use it:** the `floor:64` mean stays at about 3.5–4.7 apart from r = 512, and
+  the median gets worse with r (0.48 → 0.68). Its gap to the projection grows from about 11× to
+  about 29× (mean), and from 3× to 14× (median).
+- **No consistent trend.** The best scaling changes with r (`shared` is best at POD r = 512 and
+  worst elsewhere), and the r = 512 spike of `floor:64` appears in both bases. Each point is one
+  seed, so differences of this size may be training noise.
+- **The small gain of `floor:64` at r = 1024 comes from pressure and v_y.** Per field, POD r = 64
+  → 1024: tracer 0.40 → 0.48, pressure 8.86 → 6.59, v_x 0.155 → 0.154, v_y 7.46 → 6.79. Fourier
+  POD is the same.
+- **The LSTM beats HNODE 2–6× at every r** and stays close to flat. In these coordinates the
+  bottleneck is learning the dynamics with HNODE, not the latent space.
+- **The same 3,000 steps on 64 Swin dimensions** give 0.219, about 14× better than the best POD-family
+  HNODE (3.00, POD r = 128 `mode (Sept)`). At 9,000 steps HNODE matches the LSTM, near its own projection (0.121 vs 0.090).
+
+### Kinetic-energy spectra
+`spectral_energy.py` decodes each rollout and computes the shell-averaged kinetic-energy spectrum
+E(k, t) and the error spectrum |û_pred − û_true|²/2, in physical units, with k in units of 2π
+(domain 1 × 2). Error ÷ true energy per band, frames 100–199, energy-weighted over the 224
+trajectories (1 = no skill):
+
+| Model | k < 3.5 | 3.5–15.5 | 15.5–63.5 | ≥ 63.5 |
+|---|---|---|---|---|
+| POD HNODE `floor:64`, r = 64 | 0.029 | 0.53 | 1.4 | 1.2 |
+| POD HNODE `floor:64`, r = 256 | 0.028 | 0.73 | 4.1 | 4.1 |
+| POD HNODE `floor:64`, r = 512 | 0.041 | 1.8 | 36 | 34 |
+| POD HNODE `floor:64`, r = 1024 | 0.028 | 5.0 | 189 | 45 |
+| Fourier POD HNODE `floor:64`, r = 1024 | 0.027 | 5.3 | 115 | 3.9 |
+| POD LSTM, r = 1024 | 0.0023 | 0.20 | 4.0 | 3.0 |
+| POD projection, r = 1024 | 1.7e-5 | 0.012 | 1.2 | 1.7 |
+| Swin autoencoder projection | 2.7e-4 | 0.079 | 16 | 3,197 |
+| Swin autoencoder + HNODE, 3,000 steps | 0.0065 | 0.18 | 18 | 3,294 |
+| Swin autoencoder + HNODE, 9,000 steps | 0.0010 | 0.093 | 15 | 3,143 |
+| Pretrained Swin-HNODE | 7.4e-5 | 0.014 | 4.8 | 324 |
+
+- **Large scales do not improve with r.** HNODE's k < 3.5 error stays at about 0.03 from r = 64
+  to 1024, about 1,600× above the r = 1024 projection.
+- **Larger r adds spurious small-scale energy.** Above r ≈ 256 the model's energy at
+  k > 3.5 grows during the rollout, to 5.5× the truth at 3.5–15.5 and 188× at 15.5–63.5 for
+  POD r = 1024. The LSTM in the same space stays within about 4×.
+- **The Swin models are 3–400× better than POD r = 64 HNODE at k < 15.5,** but their decoders add a broadband
+  small-scale floor above k ≈ 10–15. It comes from 4-pixel patch blockiness (spikes at k = 64,
+  90.5, 128, 181), is already in the autoencoder projection and in the pretrained model from
+  frame 1, and stays flat after about frame 50. It is about 20% of the velocity error over frames
+  100–199. At 15.5–63.5 every Swin model is worse than Fourier POD HNODE at r = 64 (1.3).
+- **The kinetic energy is mostly v_x** (the mean shear), so these bands barely see the v_y and
+  pressure changes that move the mean VRMSE.
+- The ratios are dominated by the Re = 5e5 trajectories. Per-trajectory medians are 5–10× larger
+  but rank the models the same way. The 47 unique trajectories give the same conclusions.
+
+### Caveats
+- **One seed per point** and a fixed 3,000-step budget. Large r may need longer training or a
+  different learning rate (the r = 1024 run took 11 hours for 3,000 steps). This is the one
+  setting that could still change the answer.
+- **Unequal budgets on the Swin side:** the pretrained model trained end to end for 144,001 steps
+  with a pixel loss; the POD rows and the Swin autoencoder rows used 3,000 (or 9,000) steps with a
+  latent loss.
+- **The solver settings are not a confound.** The large-r rows used `block`, `relative_tol` and 30
+  Newton iterations; the September 64-dim runs used `dense`, an absolute tolerance and 100. On the
+  trained Swin-autoencoder HNODE models (3k and 9k steps; `hnode_runs/solver_check/`, job 5658085)
+  every combination gives the same rollouts to 5e-15 (relative), the same VRMSE to 6 digits, the same
+  Newton iterations (4.1–4.5 per window, at most 6; `relative_tol` saves about 1%), and the same
+  training gradients at h = 10 and 50 to 3e-14. Block rollouts are 3× faster (11 vs 33–39 s per rank).
+- **The pretrained encoder is not a projection floor.** It is trained only on frames 0–1, so its
+  latents of later frames decode badly (VRMSE 0.9 at frame 10, 8 at frame 199).
+
+### Outputs
+- `hnode_runs/rows/latent_dim_vrmse.png`, and per row `eval/compare.txt` and `eval/<model>/vrmse.npz`.
+- `hnode_runs/spectra/`:
+  - `spectra_{pod,fpod,swin}_{spectrogram,bands,spectra}.png` (E(k, t), band energy and error
+    versus time, E(k) at 4 frames).
+  - `spectra_vs_r.png` (band error versus r, with the Swin models at the left).
+  - `spectra_unique_*` (the same for the 47 unique trajectories).
+  - `spectra_summary.txt`.
+- `hnode_runs/latent_export/heldout/`: pretrained Swin-HNODE latents and rollouts for valid + test
+  (`run_encode.sh`); they reproduce the `MODE=eval` VRMSE (0.0424) to 3e-13 per trajectory.
+
+Rerun the spectra: `sbatch -q debug -o spectra-%j.out hnode_runs/spectra/run_spectra.sh`
+(about 7 minutes on one node).
