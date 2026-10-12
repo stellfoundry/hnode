@@ -21,8 +21,13 @@
 #
 # Environment overrides (for testing): DATA_FORMAT ("well" or "npy"), WELL_DATA_PATH,
 # CHECKPOINT_PATH ("none" = train from scratch), SAVE_PATH, NUM_EPOCHS, MAX_STEPS (stop after this many
-# optimizer steps; 0 = no limit), RUN_EVAL (0 skips the final evaluation), DDP_BACKEND (default
-# "nccl", which is RCCL on ROCm; "gloo" lets ranks share one GPU).
+# optimizer steps; 0 = no limit), TOTAL_STEPS (stop once the loss history, which a resumed checkpoint
+# carries, has this many steps; 0 = no limit), TIME_LIMIT (seconds; save and stop cleanly once a step
+# ends after it, for chained jobs; 0 = none), TEST_EVERY (rank-0 test loss every N steps, default 25),
+# BATCH_PER_RANK (trajectories per GPU, default 1: 8 GPUs give the notebook's batch 8), LR (SOAP
+# learning rate, default 1e-4),
+# RUN_EVAL (0 skips the final evaluation), DDP_BACKEND (default "nccl", which is RCCL on ROCm; "gloo"
+# lets ranks share one GPU).
 
 import os
 import time
@@ -282,7 +287,7 @@ dt = 1e-2
 num_time_steps_per_data_sample = 200
 N = 40  # number of training rollouts
 # batch_size = 8
-batch_size = 1  # per rank; the global batch is batch_size * world_size
+batch_size = int(os.environ.get("BATCH_PER_RANK", 1))  # per rank; the global batch is batch_size * world_size
 
 delta_t = dt * num_time_steps_per_data_sample / N
 N_t = (
@@ -430,7 +435,8 @@ def broadcast_parameters():
 
 
 def allreduce_gradients():
-    """Average gradients over ranks with one flattened all-reduce (equivalent to DDP)."""
+    """Average gradients over ranks with one flattened all-reduce (equivalent to DDP).
+    Returns whether the averaged gradient is finite (the same answer on every rank)."""
     params = [p for p in all_params if p.grad is not None]
     # Every rank must all-reduce the same tensors; a mismatch would hang or corrupt the collective.
     counts = torch.tensor([len(params), -len(params)], device=device)
@@ -443,6 +449,7 @@ def allreduce_gradients():
     flat.div_(world_size)
     for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
         g.copy_(synced)
+    return bool(torch.isfinite(flat).all())
 
 
 def check_parameter_sync(step):
@@ -495,8 +502,9 @@ def get_param_groups(models, weight_decay=1e-4):
 optimizer = SOAP(
     get_param_groups([nn_rhs_model, encoder, decoder]),
     precondition_frequency=10,
-    lr=1e-4,
+    lr=float(os.environ.get("LR", 1e-4)),  # the notebook's 1e-4 for batch 8
 )
+log(f"SOAP learning rate: {optimizer.param_groups[0]['lr']:g}")
 
 train_loss_history, test_loss_history = [], []
 
@@ -561,6 +569,14 @@ def compute_loss(batch):
 
 
 def save_checkpoint():
+    """Save to SAVE_PATH, keeping the previous checkpoint as SAVE_PATH.prev; never save non-finite weights."""
+    with torch.no_grad():
+        finite = all(bool(torch.isfinite(p).all()) for p in all_params)
+    if not finite:
+        log(f"Non-finite parameters at step {len(train_loss_history)}: checkpoint NOT saved")
+        return
+    if os.path.exists(SAVE_PATH):
+        os.replace(SAVE_PATH, SAVE_PATH + ".prev")
     torch.save(
         {
             "encoder": encoder.state_dict(),
@@ -754,14 +770,25 @@ if MODE == "eval":
     raise SystemExit(0)
 
 
-solver.verbose = rank == 0
+# SOLVER_VERBOSE=0 silences the per-solve "Converged after ..." lines (40 per step on rank 0).
+solver.verbose = rank == 0 and os.environ.get("SOLVER_VERBOSE", "1") != "0"
+skipped_steps = 0
 test_iter = iter(test_dataloader) if rank == 0 else None
 NUM_EPOCHS = int(os.environ.get("NUM_EPOCHS", 10))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", 0))
+TOTAL_STEPS = int(os.environ.get("TOTAL_STEPS", 0))
+TIME_LIMIT = float(os.environ.get("TIME_LIMIT", 0))
+TEST_EVERY = int(os.environ.get("TEST_EVERY", 25))
 steps_this_run = 0
+stop_training = False
+# A resumed run continues the epoch count, so the sampler does not replay earlier epochs' order.
+start_epoch = len(train_loss_history) // len(train_dataloader)
+log(f"Starting at step {len(train_loss_history)} (epoch {start_epoch}); TOTAL_STEPS={TOTAL_STEPS}, "
+    f"TIME_LIMIT={TIME_LIMIT:.0f}s, TEST_EVERY={TEST_EVERY}")
+t_run_start = time.time()
 
 t_prev = time.time()
-for epoch in range(NUM_EPOCHS):
+for epoch in range(start_epoch, start_epoch + NUM_EPOCHS):
     train_sampler.set_epoch(epoch)
     for batch_ndx, batch in enumerate(train_dataloader):
         # Per-step timing: data wait, forward, backward, all-reduce, optimizer, other (test/save/sync).
@@ -774,10 +801,21 @@ for epoch in range(NUM_EPOCHS):
         loss.backward()
         synchronize()
         t_bwd = time.time()
-        allreduce_gradients()
+        grads_ok = allreduce_gradients()
         synchronize()
         t_comm = time.time()
-        optimizer.step()
+        if grads_ok:
+            optimizer.step()
+        else:
+            # One rank's loss or gradient went non-finite (e.g. a Newton solve diverged): skip the update
+            # on every rank instead of letting the all-reduce spread NaN into all weights.
+            skipped_steps += 1
+            bad = torch.tensor([float(not torch.isfinite(loss.detach()).all())], device=device)
+            bad_ranks = [torch.zeros_like(bad) for _ in range(world_size)]
+            dist.all_gather(bad_ranks, bad)
+            log(f"Step {len(train_loss_history)}: non-finite gradient (non-finite loss on ranks "
+                f"{[r for r, b in enumerate(bad_ranks) if b.item() > 0]}); update skipped ({skipped_steps} so far)")
+            optimizer.zero_grad()
         synchronize()
         t_opt = time.time()
         timings = torch.tensor(
@@ -797,7 +835,7 @@ for epoch in range(NUM_EPOCHS):
         steps_this_run += 1
 
         if rank == 0:
-            if iteration % 25 == 0:
+            if iteration % TEST_EVERY == 0:
                 try:
                     test_batch = next(test_iter)
                 except StopIteration:
@@ -830,11 +868,26 @@ for epoch in range(NUM_EPOCHS):
                 f"| slowest rank: data {dm:.2f} fwd {fm:.2f} bwd {bm:.2f} allreduce {cm:.2f} opt {om:.2f}"
             )
 
-        if MAX_STEPS and steps_this_run >= MAX_STEPS:
+        # Stop conditions, decided identically on every rank (the time limit via an all-reduce).
+        over_time = torch.tensor([float(TIME_LIMIT > 0 and time.time() - t_run_start > TIME_LIMIT)], device=device)
+        dist.all_reduce(over_time, op=dist.ReduceOp.MAX)
+        if over_time.item() > 0:
+            log(f"Time limit reached after {steps_this_run} steps this run; saving and stopping")
+        stop_training = (
+            (MAX_STEPS and steps_this_run >= MAX_STEPS)
+            or (TOTAL_STEPS and len(train_loss_history) >= TOTAL_STEPS)
+            or over_time.item() > 0
+        )
+        if stop_training:
             break
-    if MAX_STEPS and steps_this_run >= MAX_STEPS:
+    if stop_training:
         break
 
+if device.type == "cuda":
+    peak = torch.tensor([torch.cuda.max_memory_allocated(device) / 2**30], device=device)
+    dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+    log(f"Peak GPU memory (max over ranks): {peak.item():.1f} GiB of "
+        f"{torch.cuda.get_device_properties(device).total_memory / 2**30:.0f}")
 check_parameter_sync(len(train_loss_history) - 1)
 if rank == 0 and steps_this_run > 0:
     save_checkpoint()
