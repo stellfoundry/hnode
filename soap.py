@@ -334,6 +334,25 @@ class SOAP(optim.Optimizer):
         return grad
         
 
+    _cpu_fallbacks = 0
+
+    @classmethod
+    def _checked(cls, Q, recompute, what):
+        """ROCm workaround: hipSOLVER's float32 QR can return a far-from-orthogonal Q for tiny,
+        rank-deficient preconditioners (e.g. |Q^T Q - I| = 0.43 for a 225x225 matrix with entries
+        ~1e-14, where the CPU gives 7e-7). SOAP then applies that basis and the weights blow up.
+        Check orthogonality and recompute on the CPU in float64 when it fails."""
+        if Q.device.type == "cpu":
+            return Q
+        err = (Q.T @ Q - torch.eye(Q.shape[1], device=Q.device, dtype=Q.dtype)).abs().max()
+        if torch.isfinite(err) and err.item() < 1e-3:
+            return Q
+        cls._cpu_fallbacks += 1
+        print(f"SOAP: {what} on {Q.device} not orthogonal (|Q^T Q - I| = {err.item():.2e}, "
+              f"shape {tuple(Q.shape)}); recomputed on CPU in float64 (total fallbacks: {cls._cpu_fallbacks})",
+              flush=True)
+        return recompute().to(Q.device, Q.dtype)
+
     def get_orthogonal_matrix(self, mat):
         """
         Computes the eigenbases of the preconditioner using torch.linalg.eigh decomposition.
@@ -362,6 +381,7 @@ class SOAP(optim.Optimizer):
             except:
                 _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
                 Q = Q.to(m.dtype)
+            Q = self._checked(Q, lambda m=m: torch.linalg.eigh(m.cpu().double())[1], "eigh")
             Q = torch.flip(Q, [1])
 
             if not float_data:
@@ -415,6 +435,7 @@ class SOAP(optim.Optimizer):
             o = o[:,sort_idx]
             power_iter = m @ o
             Q, _ = torch.linalg.qr(power_iter)
+            Q = self._checked(Q, lambda p=power_iter: torch.linalg.qr(p.cpu().double())[0], "QR")
 
             if not float_data:
                 Q = Q.to(original_device).type(original_type)
